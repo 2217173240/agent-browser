@@ -6,7 +6,9 @@ packages:
 minimumReleaseAge: 2880
 allowBuilds:
   '@mongodb-js/zstd': false
+  esbuild: true
   msw: false
   node-liblzma: false
   sharp: false
+  spawn-sync: true
   unrs-resolver: false
