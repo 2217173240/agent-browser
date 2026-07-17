@@ -168,8 +168,21 @@ async function executeCommand(command: BridgeCommand): Promise<unknown> {
   }
   if (command.method === "Bridge.closeTab") {
     const tabId = numberParam(command, "tabId");
-    await tabsRemove(tabId);
+    // Invalidate the operator-boundary nonce before Chrome starts tearing the
+    // page down. Runtime.bindingCalled events can arrive late while a tab is
+    // closing; without this guard, a stale overlay event may be mistaken for
+    // an explicit user Stop and terminate the whole owner session.
+    const overlay = controlOverlays.get(tabId);
+    const wasAttached = attachedTabs.has(tabId);
+    controlOverlays.delete(tabId);
     attachedTabs.delete(tabId);
+    try {
+      await tabsRemove(tabId);
+    } catch (error) {
+      if (overlay) controlOverlays.set(tabId, overlay);
+      if (wasAttached) attachedTabs.add(tabId);
+      throw error;
+    }
     return { success: true };
   }
   if (command.method === "Bridge.setControlOverlay") {
