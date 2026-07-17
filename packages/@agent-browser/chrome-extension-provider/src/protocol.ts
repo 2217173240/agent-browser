@@ -87,6 +87,18 @@ export type BridgeEvent = {
   params?: Record<string, unknown>;
 };
 
+export type BridgeControlAction = "takeover" | "stop";
+
+/** User intent emitted by the in-page operator boundary. */
+export type BridgeControlEvent = {
+  v: typeof BRIDGE_PROTOCOL_VERSION;
+  kind: "control-event";
+  profileId: string;
+  tabId: number;
+  sessionId: string;
+  action: BridgeControlAction;
+};
+
 export type BridgeDetach = {
   v: typeof BRIDGE_PROTOCOL_VERSION;
   kind: "detach";
@@ -106,6 +118,7 @@ export type BridgeMessage =
   | BridgeCommand
   | BridgeResult
   | BridgeEvent
+  | BridgeControlEvent
   | BridgeDetach
   | BridgeError;
 
@@ -125,5 +138,6 @@ export type BridgeSession = {
   sessionId: string;
   token: string;
   profileId?: string;
+  ownerSessionId?: string;
   createdAt: string;
 };

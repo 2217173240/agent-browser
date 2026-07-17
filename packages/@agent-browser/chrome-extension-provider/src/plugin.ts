@@ -35,7 +35,8 @@ export async function handlePluginRequest(input: PluginRequest): Promise<PluginR
       manifest: {
         name: PLUGIN_NAME,
         capabilities: [CAPABILITY_BROWSER_PROVIDER, CAPABILITY_COMMAND_RUN, CAPABILITY_MANAGE],
-        description: "Connect agent-browser to the current desktop Chrome through the Agent Browser Bridge extension",
+        description:
+          "Connect agent-browser to the current desktop Chrome through the Agent Browser Bridge extension",
       },
     };
   }
@@ -151,11 +152,12 @@ async function waitForProfiles(port: number, timeoutMs: number): Promise<boolean
 }
 
 async function createSession(port: number, profileId: string | undefined): Promise<BridgeSession> {
-  return await fetchJson(`http://127.0.0.1:${port}/sessions`, {
+  const ownerSessionId = process.env.NEXOLYRA_AGENT_BROWSER_SESSION_ID;
+  return (await fetchJson(`http://127.0.0.1:${port}/sessions`, {
     method: "POST",
-    body: JSON.stringify({ profileId }),
+    body: JSON.stringify({ profileId, ownerSessionId }),
     headers: { "content-type": "application/json" },
-  }) as BridgeSession;
+  })) as BridgeSession;
 }
 
 async function isHealthy(port: number): Promise<boolean> {
@@ -177,7 +179,7 @@ async function fetchJson(url: string, init?: RequestInit): Promise<Record<string
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}`);
   }
-  return await response.json() as Record<string, unknown>;
+  return (await response.json()) as Record<string, unknown>;
 }
 
 async function readPluginRequest(): Promise<PluginRequest> {
@@ -204,6 +206,8 @@ function extensionPath(): string {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   main().catch((error) => {
-    process.stdout.write(JSON.stringify(failure(error instanceof Error ? error.message : String(error))));
+    process.stdout.write(
+      JSON.stringify(failure(error instanceof Error ? error.message : String(error))),
+    );
   });
 }

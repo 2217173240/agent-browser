@@ -6,6 +6,8 @@ import { WebSocket, WebSocketServer } from "ws";
 import {
   BRIDGE_PROTOCOL_VERSION,
   type BridgeCommand,
+  type BridgeControlAction,
+  type BridgeControlEvent,
   type BridgeMessage,
   type BridgeResult,
   type BridgeSession,
@@ -13,7 +15,15 @@ import {
   type CdpRequest,
 } from "../protocol.js";
 import { CHROME_EXTENSION_PROVIDER_VERSION } from "../version.js";
-import { cdpError, isAutomatableUrl, parseTargetId, sessionIdFor, shouldExposeTab, targetIdFor, targetInfoFor } from "./cdp.js";
+import {
+  cdpError,
+  isAutomatableUrl,
+  parseTargetId,
+  sessionIdFor,
+  shouldExposeTab,
+  targetIdFor,
+  targetInfoFor,
+} from "./cdp.js";
 import { createLogger, type Logger } from "./logger.js";
 
 export type BridgeDaemonOptions = {
@@ -42,6 +52,25 @@ type PendingCommand = {
   cdpClient: WebSocket;
   cdpId: number;
   timeout: NodeJS.Timeout;
+  bridgeSessionId?: string;
+};
+
+type ControlPhase = "agent" | "human" | "stopped";
+
+type ControlState = {
+  phase: ControlPhase;
+  epoch: number;
+  updatedAt: string;
+};
+
+type QueuedControlEvent = {
+  sequence: number;
+  ownerSessionId: string;
+  bridgeSessionId: string;
+  action: BridgeControlAction;
+  tabId: number;
+  pendingActionRisk: boolean;
+  createdAt: string;
 };
 
 /** Local CDP shim that keeps browser automation in agent-browser core and forwards page commands to the extension. */
@@ -54,10 +83,13 @@ export class BridgeDaemon {
   private readonly profiles = new Map<string, ProfilePeer>();
   private readonly bridgeSessions = new Map<string, BridgeSession>();
   private readonly attachedSessions = new Map<string, AttachedSession>();
+  private readonly controlStates = new Map<string, ControlState>();
+  private readonly controlEvents: QueuedControlEvent[] = [];
   private readonly pending = new Map<string, PendingCommand>();
   private readonly cdpClients = new Set<WebSocket>();
   private attachSequence = 1;
   private commandSequence = 1;
+  private controlEventSequence = 0;
 
   constructor(options: BridgeDaemonOptions) {
     this.options = {
@@ -92,6 +124,11 @@ export class BridgeDaemon {
   }
 
   async stop(): Promise<void> {
+    await Promise.all(
+      [...this.bridgeSessions.values()].map((session) =>
+        this.setBridgeControl(session, "stopped").catch(() => undefined),
+      ),
+    );
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timeout);
     }
@@ -123,25 +160,36 @@ export class BridgeDaemon {
       sessions: [...this.bridgeSessions.values()].map((session) => ({
         sessionId: session.sessionId,
         profileId: session.profileId ?? null,
+        ownerSessionId: session.ownerSessionId ?? null,
         createdAt: session.createdAt,
+        control: this.controlStates.get(session.sessionId) ?? null,
       })),
     };
   }
 
   /** Register one short-lived CDP entrypoint for a browser.provider launch. */
-  createBridgeSession(profileId?: string): BridgeSession {
+  createBridgeSession(profileId?: string, ownerSessionId?: string): BridgeSession {
     const session: BridgeSession = {
       sessionId: randomUUID(),
       token: randomBytes(24).toString("base64url"),
       profileId,
+      ownerSessionId,
       createdAt: new Date().toISOString(),
     };
     this.bridgeSessions.set(session.sessionId, session);
+    this.controlStates.set(session.sessionId, {
+      phase: "agent",
+      epoch: 1,
+      updatedAt: new Date().toISOString(),
+    });
     return session;
   }
 
-  detachBridgeSession(sessionId: string): boolean {
+  async detachBridgeSession(sessionId: string): Promise<boolean> {
+    const session = this.bridgeSessions.get(sessionId);
+    if (session) await this.setBridgeControl(session, "stopped");
     const existed = this.bridgeSessions.delete(sessionId);
+    this.controlStates.delete(sessionId);
     for (const [attachedSessionId, attached] of this.attachedSessions) {
       if (attached.bridgeSessionId === sessionId) {
         this.attachedSessions.delete(attachedSessionId);
@@ -158,14 +206,41 @@ export class BridgeDaemon {
     }
     if (req.method === "POST" && url.pathname === "/sessions") {
       const body = await readJsonBody(req);
-      const profileId = typeof body.profileId === "string" && body.profileId ? body.profileId : undefined;
-      const session = this.createBridgeSession(profileId);
+      const profileId =
+        typeof body.profileId === "string" && body.profileId ? body.profileId : undefined;
+      const ownerSessionId =
+        typeof body.ownerSessionId === "string" && /^nex-[a-f0-9]{16}$/.test(body.ownerSessionId)
+          ? body.ownerSessionId
+          : undefined;
+      const session = this.createBridgeSession(profileId, ownerSessionId);
       this.writeJson(res, 200, session);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/control/events") {
+      const after = Math.max(0, Number.parseInt(url.searchParams.get("after") || "0", 10) || 0);
+      this.writeJson(res, 200, {
+        sequence: this.controlEventSequence,
+        events: this.controlEvents.filter((event) => event.sequence > after),
+      });
+      return;
+    }
+    const controlMatch = /^\/control\/sessions\/([^/]+)$/.exec(url.pathname);
+    if (req.method === "POST" && controlMatch) {
+      const ownerSessionId = decodeURIComponent(controlMatch[1]);
+      const body = await readJsonBody(req);
+      const phase = body.phase;
+      if (phase !== "agent" && phase !== "human" && phase !== "stopped") {
+        this.writeJson(res, 400, { error: "phase must be agent, human, or stopped" });
+        return;
+      }
+      this.writeJson(res, 200, {
+        matched: await this.setOwnerControl(ownerSessionId, phase),
+      });
       return;
     }
     const detachMatch = /^\/sessions\/([^/]+)\/detach$/.exec(url.pathname);
     if (req.method === "POST" && detachMatch) {
-      this.writeJson(res, 200, { detached: this.detachBridgeSession(detachMatch[1]) });
+      this.writeJson(res, 200, { detached: await this.detachBridgeSession(detachMatch[1]) });
       return;
     }
     this.writeJson(res, 404, { error: "not found" });
@@ -201,10 +276,16 @@ export class BridgeDaemon {
     ws.on("message", (raw) => {
       const message = parseBridgeMessage(raw);
       if (!message) {
-        ws.send(JSON.stringify({ v: BRIDGE_PROTOCOL_VERSION, kind: "error", message: "invalid bridge message" }));
+        ws.send(
+          JSON.stringify({
+            v: BRIDGE_PROTOCOL_VERSION,
+            kind: "error",
+            message: "invalid bridge message",
+          }),
+        );
         return;
       }
-      this.handleBridgeMessage(ws, message);
+      void this.handleBridgeMessage(ws, message);
     });
     ws.on("close", () => {
       for (const [profileId, peer] of this.profiles) {
@@ -215,14 +296,29 @@ export class BridgeDaemon {
     });
   }
 
-  private handleBridgeMessage(ws: WebSocket, message: BridgeMessage) {
+  private async handleBridgeMessage(ws: WebSocket, message: BridgeMessage) {
     if (message.v !== BRIDGE_PROTOCOL_VERSION) {
-      ws.send(JSON.stringify({ v: BRIDGE_PROTOCOL_VERSION, kind: "error", message: "unsupported bridge protocol version" }));
+      ws.send(
+        JSON.stringify({
+          v: BRIDGE_PROTOCOL_VERSION,
+          kind: "error",
+          message: "unsupported bridge protocol version",
+        }),
+      );
       return;
     }
     if (message.kind === "hello") {
-      if (this.options.allowedExtensionId && message.extensionId !== this.options.allowedExtensionId) {
-        ws.send(JSON.stringify({ v: BRIDGE_PROTOCOL_VERSION, kind: "error", message: "extension id is not allowed" }));
+      if (
+        this.options.allowedExtensionId &&
+        message.extensionId !== this.options.allowedExtensionId
+      ) {
+        ws.send(
+          JSON.stringify({
+            v: BRIDGE_PROTOCOL_VERSION,
+            kind: "error",
+            message: "extension id is not allowed",
+          }),
+        );
         ws.close();
         return;
       }
@@ -233,6 +329,7 @@ export class BridgeDaemon {
         ws,
         tabs: tabsToMap(message.tabs ?? []),
       });
+      await this.resyncProfileOverlays(message.profileId);
       this.logger.debug("extension profile connected", { profileId: message.profileId });
       return;
     }
@@ -248,7 +345,17 @@ export class BridgeDaemon {
       return;
     }
     if (message.kind === "cdp-event") {
-      this.forwardCdpEvent(message.profileId, message.tabId, message.sessionId, message.method, message.params ?? {});
+      this.forwardCdpEvent(
+        message.profileId,
+        message.tabId,
+        message.sessionId,
+        message.method,
+        message.params ?? {},
+      );
+      return;
+    }
+    if (message.kind === "control-event") {
+      await this.handleControlEvent(message);
     }
   }
 
@@ -284,7 +391,11 @@ export class BridgeDaemon {
       }
       await this.forwardPageLevel(ws, bridgeSession, message);
     } catch (error) {
-      this.sendCdpError(ws, message.id, cdpError(error instanceof Error ? error.message : String(error)));
+      this.sendCdpError(
+        ws,
+        message.id,
+        cdpError(error instanceof Error ? error.message : String(error)),
+      );
     }
   }
 
@@ -294,7 +405,10 @@ export class BridgeDaemon {
     return this.bridgeSessions.get(sessionId);
   }
 
-  private async routeBrowserLevel(bridgeSession: BridgeSession, request: CdpRequest): Promise<{ handled: boolean; result?: unknown }> {
+  private async routeBrowserLevel(
+    bridgeSession: BridgeSession,
+    request: CdpRequest,
+  ): Promise<{ handled: boolean; result?: unknown }> {
     const method = request.method;
     if (!method) return { handled: false };
     if (method === "Browser.getVersion") {
@@ -326,11 +440,18 @@ export class BridgeDaemon {
         result: {
           targetInfos: [...peer.tabs.values()]
             .filter(shouldExposeTab)
-            .map((tab) => targetInfoFor(peer.profileId, tab, this.hasAttachedSession(peer.profileId, tab.tabId))),
+            .map((tab) =>
+              targetInfoFor(
+                peer.profileId,
+                tab,
+                this.hasAttachedSession(peer.profileId, tab.tabId),
+              ),
+            ),
         },
       };
     }
     if (method === "Target.createTarget") {
+      this.assertAgentControl(bridgeSession);
       const peer = this.selectProfile(bridgeSession);
       const url = stringParam(request.params, "url") || "about:blank";
       if (!isAutomatableUrl(url)) {
@@ -344,17 +465,29 @@ export class BridgeDaemon {
       return { handled: true, result: { targetId: targetIdFor(peer.profileId, tab.tabId) } };
     }
     if (method === "Target.attachToTarget") {
+      this.assertAgentControl(bridgeSession);
       const targetId = stringParam(request.params, "targetId");
       if (!targetId) throw new Error("Target.attachToTarget requires targetId");
       const ref = parseTargetId(targetId);
       if (!ref) throw new Error(`Unknown targetId: ${targetId}`);
       const peer = this.profiles.get(ref.profileId);
-      if (!peer || !peer.tabs.has(ref.tabId)) throw new Error(`Target is not available: ${targetId}`);
+      if (!peer || !peer.tabs.has(ref.tabId))
+        throw new Error(`Target is not available: ${targetId}`);
       const sessionId = sessionIdFor(ref.tabId, this.attachSequence++);
-      this.attachedSessions.set(sessionId, { sessionId, bridgeSessionId: bridgeSession.sessionId, profileId: ref.profileId, tabId: ref.tabId });
+      this.attachedSessions.set(sessionId, {
+        sessionId,
+        bridgeSessionId: bridgeSession.sessionId,
+        profileId: ref.profileId,
+        tabId: ref.tabId,
+      });
+      await this.showControlOverlay(
+        bridgeSession,
+        this.attachedSessions.get(sessionId) as AttachedSession,
+      );
       return { handled: true, result: { sessionId } };
     }
     if (method === "Target.activateTarget") {
+      this.assertAgentControl(bridgeSession);
       const targetId = stringParam(request.params, "targetId");
       const peerAndTab = this.peerAndTabFromTargetId(targetId);
       await this.sendBridgeCommand(peerAndTab.peer, {
@@ -364,6 +497,7 @@ export class BridgeDaemon {
       return { handled: true, result: {} };
     }
     if (method === "Target.closeTarget") {
+      this.assertAgentControl(bridgeSession);
       const targetId = stringParam(request.params, "targetId");
       const peerAndTab = this.peerAndTabFromTargetId(targetId);
       await this.sendBridgeCommand(peerAndTab.peer, {
@@ -381,25 +515,159 @@ export class BridgeDaemon {
       this.sendCdpResult(ws, request.id as number, {});
       return;
     }
+    this.assertAgentControl(bridgeSession);
     const attached = request.sessionId ? this.attachedSessions.get(request.sessionId) : undefined;
     if (!attached) {
       const peer = this.selectProfile(bridgeSession);
-      const activeTab = [...peer.tabs.values()].find((tab) => tab.active && shouldExposeTab(tab)) ?? [...peer.tabs.values()].find(shouldExposeTab);
+      const activeTab =
+        [...peer.tabs.values()].find((tab) => tab.active && shouldExposeTab(tab)) ??
+        [...peer.tabs.values()].find(shouldExposeTab);
       if (!activeTab) throw new Error("No automatable tab is available");
       const sessionId = sessionIdFor(activeTab.tabId, this.attachSequence++);
-      this.attachedSessions.set(sessionId, { sessionId, bridgeSessionId: bridgeSession.sessionId, profileId: peer.profileId, tabId: activeTab.tabId });
+      this.attachedSessions.set(sessionId, {
+        sessionId,
+        bridgeSessionId: bridgeSession.sessionId,
+        profileId: peer.profileId,
+        tabId: activeTab.tabId,
+      });
       request.sessionId = sessionId;
+      await this.showControlOverlay(
+        bridgeSession,
+        this.attachedSessions.get(sessionId) as AttachedSession,
+      );
     }
     const session = this.attachedSessions.get(request.sessionId as string);
     if (!session) throw new Error(`Unknown sessionId: ${request.sessionId}`);
     const peer = this.profiles.get(session.profileId);
     if (!peer) throw new Error(`Profile is offline: ${session.profileId}`);
+    await this.sendBridgeCommand(
+      peer,
+      {
+        method: request.method as string,
+        params: request.params ?? {},
+        sessionId: session.sessionId,
+        tabId: session.tabId,
+      },
+      ws,
+      request.id as number,
+      bridgeSession.sessionId,
+    );
+  }
+
+  private assertAgentControl(session: BridgeSession): void {
+    const state = this.controlStates.get(session.sessionId);
+    if (state?.phase === "human") throw new Error("Browser control is held by the user");
+    if (state?.phase === "stopped") throw new Error("Browser control is stopped");
+  }
+
+  private async showControlOverlay(
+    bridgeSession: BridgeSession,
+    attached: AttachedSession,
+  ): Promise<void> {
+    const peer = this.profiles.get(attached.profileId);
+    if (!peer) return;
+    const phase = this.controlStates.get(bridgeSession.sessionId)?.phase ?? "agent";
     await this.sendBridgeCommand(peer, {
-      method: request.method as string,
-      params: request.params ?? {},
-      sessionId: session.sessionId,
-      tabId: session.tabId,
-    }, ws, request.id as number);
+      method: "Bridge.setControlOverlay",
+      sessionId: attached.sessionId,
+      tabId: attached.tabId,
+      params: { phase },
+    });
+  }
+
+  private async resyncProfileOverlays(profileId: string): Promise<void> {
+    for (const attached of this.attachedSessions.values()) {
+      if (attached.profileId !== profileId) continue;
+      const session = this.bridgeSessions.get(attached.bridgeSessionId);
+      if (session) await this.showControlOverlay(session, attached).catch(() => undefined);
+    }
+  }
+
+  private async handleControlEvent(message: BridgeControlEvent): Promise<void> {
+    const attached = this.attachedSessions.get(message.sessionId);
+    if (!attached || attached.profileId !== message.profileId || attached.tabId !== message.tabId)
+      return;
+    const bridgeSession = this.bridgeSessions.get(attached.bridgeSessionId);
+    if (!bridgeSession?.ownerSessionId) return;
+    const current = this.controlStates.get(bridgeSession.sessionId);
+    if (message.action === "takeover" && current?.phase !== "agent") return;
+    if (message.action === "stop" && current?.phase === "stopped") return;
+    const pendingActionRisk = [...this.pending.values()].some(
+      (pending) => pending.bridgeSessionId === bridgeSession.sessionId,
+    );
+    await this.setBridgeControl(bridgeSession, message.action === "takeover" ? "human" : "stopped");
+    const event: QueuedControlEvent = {
+      sequence: ++this.controlEventSequence,
+      ownerSessionId: bridgeSession.ownerSessionId,
+      bridgeSessionId: bridgeSession.sessionId,
+      action: message.action,
+      tabId: message.tabId,
+      pendingActionRisk,
+      createdAt: new Date().toISOString(),
+    };
+    this.controlEvents.push(event);
+    if (this.controlEvents.length > 256)
+      this.controlEvents.splice(0, this.controlEvents.length - 256);
+  }
+
+  private async setOwnerControl(ownerSessionId: string, phase: ControlPhase): Promise<number> {
+    const sessions = [...this.bridgeSessions.values()].filter(
+      (session) => session.ownerSessionId === ownerSessionId,
+    );
+    for (const session of sessions) await this.setBridgeControl(session, phase);
+    return sessions.length;
+  }
+
+  private async setBridgeControl(session: BridgeSession, phase: ControlPhase): Promise<void> {
+    const current = this.controlStates.get(session.sessionId);
+    if (current?.phase === phase) return;
+    this.controlStates.set(session.sessionId, {
+      phase,
+      epoch: (current?.epoch ?? 0) + 1,
+      updatedAt: new Date().toISOString(),
+    });
+    if (phase !== "agent") this.cancelPendingForSession(session.sessionId, phase);
+    const attached = [...this.attachedSessions.values()].filter(
+      (entry) => entry.bridgeSessionId === session.sessionId,
+    );
+    for (const entry of attached) {
+      const peer = this.profiles.get(entry.profileId);
+      if (!peer || peer.ws.readyState !== WebSocket.OPEN) {
+        if (phase === "stopped") this.attachedSessions.delete(entry.sessionId);
+        continue;
+      }
+      this.sendBridgeNotification(peer, {
+        method: "Bridge.setControlOverlay",
+        sessionId: entry.sessionId,
+        tabId: entry.tabId,
+        params: { phase },
+      });
+      if (phase === "stopped") {
+        this.sendBridgeNotification(peer, {
+          method: "Bridge.detachTab",
+          sessionId: entry.sessionId,
+          tabId: entry.tabId,
+        });
+        this.attachedSessions.delete(entry.sessionId);
+      }
+    }
+  }
+
+  private cancelPendingForSession(bridgeSessionId: string, phase: ControlPhase): void {
+    for (const [reqId, pending] of this.pending) {
+      if (pending.bridgeSessionId !== bridgeSessionId) continue;
+      clearTimeout(pending.timeout);
+      this.pending.delete(reqId);
+      this.sendCdpError(
+        pending.cdpClient,
+        pending.cdpId,
+        cdpError(
+          phase === "human"
+            ? "Browser control was taken over by the user"
+            : "Browser control was stopped",
+        ),
+      );
+    }
   }
 
   private selectProfile(session: BridgeSession): ProfilePeer {
@@ -409,9 +677,13 @@ export class BridgeDaemon {
       throw new Error(`Chrome extension profile '${session.profileId}' is not connected`);
     }
     if (this.profiles.size === 0) {
-      throw new Error("No Chrome extension profile is connected. Load the Agent Browser Bridge extension, then retry.");
+      throw new Error(
+        "No Chrome extension profile is connected. Load the Agent Browser Bridge extension, then retry.",
+      );
     }
-    throw new Error("Multiple Chrome extension profiles are connected. Set AGENT_BROWSER_CHROME_BRIDGE_PROFILE or run plugin status to choose one.");
+    throw new Error(
+      "Multiple Chrome extension profiles are connected. Set AGENT_BROWSER_CHROME_BRIDGE_PROFILE or run plugin status to choose one.",
+    );
   }
 
   private trySelectProfile(session: BridgeSession): ProfilePeer | undefined {
@@ -420,7 +692,10 @@ export class BridgeDaemon {
     return undefined;
   }
 
-  private peerAndTabFromTargetId(targetId: string | undefined): { peer: ProfilePeer; tab: BridgeTab } {
+  private peerAndTabFromTargetId(targetId: string | undefined): {
+    peer: ProfilePeer;
+    tab: BridgeTab;
+  } {
     if (!targetId) throw new Error("targetId is required");
     const ref = parseTargetId(targetId);
     if (!ref) throw new Error(`Unknown targetId: ${targetId}`);
@@ -442,6 +717,7 @@ export class BridgeDaemon {
     command: Omit<BridgeCommand, "v" | "kind" | "reqId" | "profileId">,
     cdpClient?: WebSocket,
     cdpId?: number,
+    bridgeSessionId?: string,
   ): Promise<T> {
     const reqId = `r_${this.commandSequence++}`;
     const payload: BridgeCommand = {
@@ -454,9 +730,13 @@ export class BridgeDaemon {
     if (cdpClient && typeof cdpId === "number") {
       const timeout = setTimeout(() => {
         this.pending.delete(reqId);
-        this.sendCdpError(cdpClient, cdpId, cdpError(`Timed out waiting for extension response to ${payload.method}`));
+        this.sendCdpError(
+          cdpClient,
+          cdpId,
+          cdpError(`Timed out waiting for extension response to ${payload.method}`),
+        );
       }, this.options.commandTimeoutMs);
-      this.pending.set(reqId, { cdpClient, cdpId, timeout });
+      this.pending.set(reqId, { cdpClient, cdpId, timeout, bridgeSessionId });
       peer.ws.send(JSON.stringify(payload));
       return undefined as T;
     }
@@ -472,6 +752,22 @@ export class BridgeDaemon {
       });
       peer.ws.send(JSON.stringify(payload));
     });
+  }
+
+  private sendBridgeNotification(
+    peer: ProfilePeer,
+    command: Omit<BridgeCommand, "v" | "kind" | "reqId" | "profileId">,
+  ): void {
+    if (peer.ws.readyState !== WebSocket.OPEN) return;
+    peer.ws.send(
+      JSON.stringify({
+        v: BRIDGE_PROTOCOL_VERSION,
+        kind: "cdp-command",
+        reqId: `n_${this.commandSequence++}`,
+        profileId: peer.profileId,
+        ...command,
+      } satisfies BridgeCommand),
+    );
   }
 
   private resolvePending(message: BridgeResult) {
@@ -494,8 +790,15 @@ export class BridgeDaemon {
     }
   }
 
-  private forwardCdpEvent(profileId: string, tabId: number | undefined, sessionId: string | undefined, method: string, params: Record<string, unknown>) {
-    const resolvedSessionId = sessionId ?? (tabId ? this.firstSessionForTab(profileId, tabId) : undefined);
+  private forwardCdpEvent(
+    profileId: string,
+    tabId: number | undefined,
+    sessionId: string | undefined,
+    method: string,
+    params: Record<string, unknown>,
+  ) {
+    const resolvedSessionId =
+      sessionId ?? (tabId ? this.firstSessionForTab(profileId, tabId) : undefined);
     const event = JSON.stringify({
       method,
       params,
@@ -574,7 +877,10 @@ type ResultSocket<T = unknown> = WebSocket & {
   reject: (error: Error) => void;
 };
 
-function resultSocket<T>(resolve: (value: T) => void, reject: (error: Error) => void): ResultSocket<T> {
+function resultSocket<T>(
+  resolve: (value: T) => void,
+  reject: (error: Error) => void,
+): ResultSocket<T> {
   return { resolve, reject } as ResultSocket<T>;
 }
 

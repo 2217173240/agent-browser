@@ -1,6 +1,7 @@
 import {
   BRIDGE_PROTOCOL_VERSION,
   type BridgeCommand,
+  type BridgeControlAction,
   type BridgeMessage,
   type BridgeTab,
 } from "../src/protocol";
@@ -12,7 +13,16 @@ type StoredConfig = {
 };
 
 const DEFAULT_PORT = 19826;
+const CONTROL_BINDING = "__agentBrowserControl";
 const attachedTabs = new Set<number>();
+const controlOverlays = new Map<
+  number,
+  {
+    nonce: string;
+    sessionId: string;
+    phase: "agent" | "human" | "stopped";
+  }
+>();
 let bridge: WebSocket | null = null;
 let activePort = DEFAULT_PORT;
 let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -33,11 +43,26 @@ export default defineBackground(() => {
   chrome.tabs.onCreated.addListener(() => scheduleHeartbeat());
   chrome.tabs.onUpdated.addListener(() => scheduleHeartbeat());
   chrome.tabs.onRemoved.addListener((tabId) => {
+    const overlay = controlOverlays.get(tabId);
+    if (overlay && overlay.phase !== "stopped") {
+      void emitControlEvent(tabId, overlay.sessionId, "stop");
+    }
     attachedTabs.delete(tabId);
+    controlOverlays.delete(tabId);
     scheduleHeartbeat();
   });
   chrome.debugger.onEvent.addListener((source, method, params) => {
     if (!source.tabId) return;
+    if (method === "Runtime.bindingCalled" && handleControlBinding(source.tabId, params)) return;
+    if (method === "Page.frameNavigated" || method === "Page.loadEventFired") {
+      const overlay = controlOverlays.get(source.tabId);
+      if (overlay) {
+        setTimeout(
+          () => void injectControlOverlay(source.tabId as number, overlay).catch(() => undefined),
+          25,
+        );
+      }
+    }
     void sendBridgeMessage({
       v: BRIDGE_PROTOCOL_VERSION,
       kind: "cdp-event",
@@ -48,7 +73,14 @@ export default defineBackground(() => {
     });
   });
   chrome.debugger.onDetach.addListener((source, reason) => {
-    if (source.tabId) attachedTabs.delete(source.tabId);
+    if (source.tabId) {
+      const overlay = controlOverlays.get(source.tabId);
+      if (overlay && overlay.phase !== "stopped") {
+        void emitControlEvent(source.tabId, overlay.sessionId, "stop");
+      }
+      attachedTabs.delete(source.tabId);
+      controlOverlays.delete(source.tabId);
+    }
     if (!source.tabId) return;
     void sendBridgeMessage({
       v: BRIDGE_PROTOCOL_VERSION,
@@ -140,11 +172,46 @@ async function executeCommand(command: BridgeCommand): Promise<unknown> {
     attachedTabs.delete(tabId);
     return { success: true };
   }
+  if (command.method === "Bridge.setControlOverlay") {
+    const tabId = command.tabId ?? numberParam(command, "tabId");
+    const sessionId = command.sessionId;
+    const phase = command.params?.phase;
+    if (!sessionId) throw new Error("Bridge.setControlOverlay requires sessionId");
+    if (phase !== "agent" && phase !== "human" && phase !== "stopped") {
+      throw new Error("Bridge.setControlOverlay requires a valid phase");
+    }
+    await ensureDebuggerAttached(tabId);
+    const current = controlOverlays.get(tabId);
+    const overlay = {
+      nonce: current?.sessionId === sessionId ? current.nonce : crypto.randomUUID(),
+      sessionId,
+      phase,
+    };
+    controlOverlays.set(tabId, overlay);
+    await injectControlOverlay(tabId, overlay);
+    return { visible: true, phase };
+  }
+  if (command.method === "Bridge.detachTab") {
+    const tabId = command.tabId ?? numberParam(command, "tabId");
+    const overlay = controlOverlays.get(tabId);
+    if (overlay) {
+      overlay.phase = "stopped";
+      await injectControlOverlay(tabId, overlay).catch(() => undefined);
+    }
+    if (attachedTabs.has(tabId)) {
+      await debuggerDetach({ tabId }).catch(() => undefined);
+    }
+    attachedTabs.delete(tabId);
+    controlOverlays.delete(tabId);
+    return { detached: true };
+  }
   const tabId = command.tabId;
   if (typeof tabId !== "number") {
     throw new Error(`CDP command ${command.method} is missing tabId`);
   }
   await ensureDebuggerAttached(tabId);
+  const overlay = controlOverlays.get(tabId);
+  if (overlay) await injectControlOverlay(tabId, overlay);
   return await debuggerSendCommand({ tabId }, command.method, command.params ?? {});
 }
 
@@ -152,6 +219,89 @@ async function ensureDebuggerAttached(tabId: number) {
   if (attachedTabs.has(tabId)) return;
   await debuggerAttach({ tabId }, "1.3");
   attachedTabs.add(tabId);
+}
+
+function handleControlBinding(tabId: number, params: unknown): boolean {
+  if (!params || typeof params !== "object") return false;
+  const value = params as { name?: unknown; payload?: unknown };
+  if (value.name !== CONTROL_BINDING || typeof value.payload !== "string") return false;
+  const overlay = controlOverlays.get(tabId);
+  if (!overlay) return true;
+  try {
+    const payload = JSON.parse(value.payload) as { nonce?: unknown; action?: unknown };
+    if (payload.nonce !== overlay.nonce) return true;
+    if (payload.action !== "takeover" && payload.action !== "stop") return true;
+    if (overlay.phase !== "agent" && payload.action === "takeover") return true;
+    void emitControlEvent(tabId, overlay.sessionId, payload.action as BridgeControlAction);
+  } catch {
+    // The page can call Runtime bindings; malformed or stale payloads are ignored.
+  }
+  return true;
+}
+
+async function emitControlEvent(
+  tabId: number,
+  sessionId: string,
+  action: BridgeControlAction,
+): Promise<void> {
+  await sendBridgeMessage({
+    v: BRIDGE_PROTOCOL_VERSION,
+    kind: "control-event",
+    profileId: "",
+    tabId,
+    sessionId,
+    action,
+  });
+}
+
+async function injectControlOverlay(
+  tabId: number,
+  overlay: { nonce: string; sessionId: string; phase: "agent" | "human" | "stopped" },
+): Promise<void> {
+  await debuggerSendCommand({ tabId }, "Runtime.enable", {}).catch(() => undefined);
+  await debuggerSendCommand({ tabId }, "Runtime.addBinding", { name: CONTROL_BINDING }).catch(
+    () => undefined,
+  );
+  const config = JSON.stringify({
+    binding: CONTROL_BINDING,
+    nonce: overlay.nonce,
+    phase: overlay.phase,
+  });
+  const expression = `(() => {
+    const config = ${config};
+    const id = "__agent_browser_operator_boundary__";
+    document.getElementById(id)?.remove();
+    const host = document.createElement("div");
+    host.id = id;
+    host.style.cssText = "all:initial;position:fixed;inset:0;z-index:2147483647;pointer-events:none;box-shadow:inset 0 0 0 3px #2563eb,inset 0 0 28px rgba(37,99,235,.38);font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif";
+    const shadow = host.attachShadow({ mode: "open" });
+    const bar = document.createElement("div");
+    bar.style.cssText = "position:fixed;left:50%;bottom:18px;transform:translateX(-50%);display:flex;gap:8px;align-items:center;padding:8px 10px;border-radius:999px;background:#111827;color:#fff;box-shadow:0 8px 28px rgba(0,0,0,.35);pointer-events:auto;font:600 13px/1.2 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif";
+    const label = document.createElement("span");
+    label.textContent = config.phase === "agent" ? "Agent is browsing…" : config.phase === "human" ? "You’re in control · Resume in Nexolyra" : "Browser control stopped";
+    label.style.cssText = "padding:0 6px;white-space:nowrap";
+    bar.append(label);
+    const button = (text, action, primary) => {
+      const node = document.createElement("button");
+      node.textContent = text;
+      node.type = "button";
+      node.style.cssText = "all:unset;cursor:pointer;border-radius:999px;padding:7px 11px;background:" + (primary ? "#2563eb" : "#374151") + ";color:#fff;font-weight:700";
+      node.addEventListener("click", () => {
+        const binding = window[config.binding];
+        if (typeof binding === "function") binding(JSON.stringify({ nonce: config.nonce, action }));
+      });
+      return node;
+    };
+    if (config.phase === "agent") bar.append(button("Take over", "takeover", true));
+    if (config.phase !== "stopped") bar.append(button("Stop", "stop", false));
+    shadow.append(bar);
+    (document.documentElement || document.body)?.append(host);
+  })()`;
+  await debuggerSendCommand({ tabId }, "Runtime.evaluate", {
+    expression,
+    awaitPromise: false,
+    returnByValue: true,
+  });
 }
 
 async function sendHello() {
@@ -174,7 +324,11 @@ async function sendHeartbeat() {
   });
 }
 
-async function sendResult(reqId: string, result?: unknown, error?: { code: number; message: string }) {
+async function sendResult(
+  reqId: string,
+  result?: unknown,
+  error?: { code: number; message: string },
+) {
   await sendBridgeMessage({
     v: BRIDGE_PROTOCOL_VERSION,
     kind: "cdp-result",
@@ -258,7 +412,10 @@ function tabsCreate(createProperties: chrome.tabs.CreateProperties): Promise<chr
   return chromeCall((done) => chrome.tabs.create(createProperties, done));
 }
 
-function tabsUpdate(tabId: number, updateProperties: chrome.tabs.UpdateProperties): Promise<chrome.tabs.Tab> {
+function tabsUpdate(
+  tabId: number,
+  updateProperties: chrome.tabs.UpdateProperties,
+): Promise<chrome.tabs.Tab> {
   return chromeCall((done) => chrome.tabs.update(tabId, updateProperties, done));
 }
 
@@ -266,7 +423,10 @@ function tabsRemove(tabId: number): Promise<void> {
   return chromeCall((done) => chrome.tabs.remove(tabId, done));
 }
 
-function windowsUpdate(windowId: number, updateInfo: chrome.windows.UpdateInfo): Promise<chrome.windows.Window> {
+function windowsUpdate(
+  windowId: number,
+  updateInfo: chrome.windows.UpdateInfo,
+): Promise<chrome.windows.Window> {
   return chromeCall((done) => chrome.windows.update(windowId, updateInfo, done));
 }
 
@@ -274,7 +434,15 @@ function debuggerAttach(target: chrome.debugger.Debuggee, version: string): Prom
   return chromeCall((done) => chrome.debugger.attach(target, version, done));
 }
 
-function debuggerSendCommand(target: chrome.debugger.Debuggee, method: string, params: Record<string, unknown>): Promise<unknown> {
+function debuggerDetach(target: chrome.debugger.Debuggee): Promise<void> {
+  return chromeCall((done) => chrome.debugger.detach(target, done));
+}
+
+function debuggerSendCommand(
+  target: chrome.debugger.Debuggee,
+  method: string,
+  params: Record<string, unknown>,
+): Promise<unknown> {
   return chromeCall((done) => chrome.debugger.sendCommand(target, method, params, done));
 }
 

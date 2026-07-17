@@ -42,18 +42,22 @@ test("plugin status reports offline daemon without failing", async () => {
 test("plugin launch returns a CDP URL after an extension profile connects", async () => {
   const port = await freePort();
   const oldPort = process.env.AGENT_BROWSER_CHROME_BRIDGE_PORT;
+  const oldOwnerSessionId = process.env.NEXOLYRA_AGENT_BROWSER_SESSION_ID;
   process.env.AGENT_BROWSER_CHROME_BRIDGE_PORT = String(port);
+  process.env.NEXOLYRA_AGENT_BROWSER_SESSION_ID = "nex-aaaaaaaaaaaaaaaa";
   const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
   const extension = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
   await onceOpen(extension);
-  extension.send(JSON.stringify({
-    v: 1,
-    kind: "hello",
-    profileId: "profile-a",
-    extensionId: "extension-id",
-    tabs: [{ tabId: 1, url: "https://example.com", title: "Example", active: true }],
-  }));
+  extension.send(
+    JSON.stringify({
+      v: 1,
+      kind: "hello",
+      profileId: "profile-a",
+      extensionId: "extension-id",
+      tabs: [{ tabId: 1, url: "https://example.com", title: "Example", active: true }],
+    }),
+  );
 
   try {
     const response = await handlePluginRequest({
@@ -63,9 +67,14 @@ test("plugin launch returns a CDP URL after an extension profile connects", asyn
       request: {},
     });
     assert.equal(response.success, true);
-    assert.match(response.browser.cdpUrl, new RegExp(`^ws://127\\.0\\.0\\.1:${port}/devtools/browser/bridge`));
+    assert.match(
+      response.browser.cdpUrl,
+      new RegExp(`^ws://127\\.0\\.0\\.1:${port}/devtools/browser/bridge`),
+    );
     assert.equal(response.browser.directPage, false);
     assert.equal(response.browser.cleanup.port, port);
+    const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
+    assert.equal(health.sessions[0].ownerSessionId, "nex-aaaaaaaaaaaaaaaa");
 
     const close = await handlePluginRequest({
       protocol: "agent-browser.plugin.v1",
@@ -78,6 +87,7 @@ test("plugin launch returns a CDP URL after an extension profile connects", asyn
     extension.close();
     await daemon.stop();
     restoreEnv("AGENT_BROWSER_CHROME_BRIDGE_PORT", oldPort);
+    restoreEnv("NEXOLYRA_AGENT_BROWSER_SESSION_ID", oldOwnerSessionId);
   }
 });
 

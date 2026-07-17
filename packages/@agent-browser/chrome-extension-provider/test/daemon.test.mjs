@@ -90,6 +90,69 @@ test("daemon requires an explicit profile when multiple extension profiles are c
   }
 });
 
+test("page takeover fences queued and future CDP commands and emits a bounded owner event", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
+  ]);
+
+  try {
+    const session = await postJson(port, "/sessions", { ownerSessionId: "nex-aaaaaaaaaaaaaaaa" });
+    const cdp = await connectCdp(port, session.sessionId, session.token);
+    const attached = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:101", flatten: true },
+    });
+
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "control-event",
+        profileId: "profile-a",
+        tabId: 101,
+        sessionId: attached.result.sessionId,
+        action: "takeover",
+      }),
+    );
+    await waitFor(async () => {
+      const events = await fetchJson(port, "/control/events?after=0");
+      return events.events.length === 1;
+    });
+
+    const blocked = await cdpCommand(cdp, {
+      id: 2,
+      sessionId: attached.result.sessionId,
+      method: "Runtime.evaluate",
+      params: { expression: "document.title" },
+    });
+    assert.match(blocked.error.message, /held by the user/);
+
+    const events = await fetchJson(port, "/control/events?after=0");
+    assert.equal(events.events[0].ownerSessionId, "nex-aaaaaaaaaaaaaaaa");
+    assert.equal(events.events[0].action, "takeover");
+    assert.equal(events.events[0].pendingActionRisk, false);
+
+    const resumed = await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", {
+      phase: "agent",
+    });
+    assert.equal(resumed.matched, 1);
+    const evaluated = await cdpCommand(cdp, {
+      id: 3,
+      sessionId: attached.result.sessionId,
+      method: "Runtime.evaluate",
+      params: { expression: "document.title" },
+    });
+    assert.equal(evaluated.result.result.value, "ok");
+    cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
 async function connectExtension(port, profileId, tabs) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
   await onceOpen(ws);
@@ -104,31 +167,37 @@ async function connectExtension(port, profileId, tabs) {
         title: "Created",
         active: true,
       };
-      ws.send(JSON.stringify({
+      ws.send(
+        JSON.stringify({
+          v: 1,
+          kind: "cdp-result",
+          reqId: message.reqId,
+          result: tab,
+        }),
+      );
+      return;
+    }
+    ws.send(
+      JSON.stringify({
         v: 1,
         kind: "cdp-result",
         reqId: message.reqId,
-        result: tab,
-      }));
-      return;
-    }
-    ws.send(JSON.stringify({
-      v: 1,
-      kind: "cdp-result",
-      reqId: message.reqId,
-      result: {
-        result: { type: "string", value: "ok" },
-      },
-    }));
+        result: {
+          result: { type: "string", value: "ok" },
+        },
+      }),
+    );
   });
-  ws.send(JSON.stringify({
-    v: 1,
-    kind: "hello",
-    profileId,
-    extensionId: "extension-id",
-    chromeVersion: "120.0.0.0",
-    tabs,
-  }));
+  ws.send(
+    JSON.stringify({
+      v: 1,
+      kind: "hello",
+      profileId,
+      extensionId: "extension-id",
+      chromeVersion: "120.0.0.0",
+      tabs,
+    }),
+  );
   await waitFor(async () => {
     const health = await fetchJson(port, "/health");
     return health.profiles.some((profile) => profile.profileId === profileId);
@@ -138,7 +207,9 @@ async function connectExtension(port, profileId, tabs) {
 
 async function assertInvalidToken(port) {
   await new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/devtools/browser/bridge?session=missing&token=bad`);
+    const ws = new WebSocket(
+      `ws://127.0.0.1:${port}/devtools/browser/bridge?session=missing&token=bad`,
+    );
     ws.on("unexpected-response", (_request, response) => {
       assert.equal(response.statusCode, 401);
       resolve();
@@ -149,25 +220,28 @@ async function assertInvalidToken(port) {
 }
 
 async function connectCdp(port, sessionId, token) {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/devtools/browser/bridge?session=${sessionId}&token=${token}`);
+  const ws = new WebSocket(
+    `ws://127.0.0.1:${port}/devtools/browser/bridge?session=${sessionId}&token=${token}`,
+  );
   await onceOpen(ws);
   return ws;
 }
 
 async function cdpCommand(ws, command) {
   return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ws.off("message", onMessage);
+      reject(new Error(`timed out waiting for ${command.method}`));
+    }, 5000);
     const onMessage = (raw) => {
       const message = JSON.parse(String(raw));
       if (message.id !== command.id) return;
       ws.off("message", onMessage);
+      clearTimeout(timer);
       resolve(message);
     };
     ws.on("message", onMessage);
     ws.send(JSON.stringify(command));
-    setTimeout(() => {
-      ws.off("message", onMessage);
-      reject(new Error(`timed out waiting for ${command.method}`));
-    }, 5000);
   });
 }
 
