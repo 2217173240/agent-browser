@@ -90,6 +90,76 @@ test("daemon requires an explicit profile when multiple extension profiles are c
   }
 });
 
+test("daemon selects the unique Chrome profile containing the host session route", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const unrelated = await connectExtension(port, "profile-a", [
+    { tabId: 1, url: "https://work.example/session/other", title: "Other", active: true },
+  ]);
+  const owning = await connectExtension(port, "profile-b", [
+    {
+      tabId: 2,
+      url: "http://127.0.0.1:3458/workspace/it/session/674fb240-55e4-427e-a544-60c5b22226f0/",
+      title: "Nexolyra",
+      active: true,
+    },
+  ]);
+
+  try {
+    const session = await postJson(port, "/sessions", {
+      profileUrlHint: "/session/674fb240-55e4-427e-a544-60c5b22226f0/",
+    });
+    const cdp = await connectCdp(port, session.sessionId, session.token);
+    const response = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.getTargets",
+      params: {},
+    });
+    assert.equal(response.error, undefined);
+    assert.deepEqual(
+      response.result.targetInfos.map((target) => target.url),
+      ["http://127.0.0.1:3458/workspace/it/session/674fb240-55e4-427e-a544-60c5b22226f0/"],
+    );
+    const health = await fetchJson(port, "/health");
+    assert.equal(health.sessions[0].profileId, "profile-b");
+    assert.equal("profileUrlHint" in health.sessions[0], false);
+    cdp.close();
+  } finally {
+    unrelated.close();
+    owning.close();
+    await daemon.stop();
+  }
+});
+
+test("daemon preserves the multiple-profile error when a route hint is ambiguous", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const first = await connectExtension(port, "profile-a", [
+    { tabId: 1, url: "https://a.example/session/shared", title: "A", active: true },
+  ]);
+  const second = await connectExtension(port, "profile-b", [
+    { tabId: 2, url: "https://b.example/session/shared", title: "B", active: true },
+  ]);
+
+  try {
+    const session = await postJson(port, "/sessions", { profileUrlHint: "/session/shared" });
+    const cdp = await connectCdp(port, session.sessionId, session.token);
+    const response = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.getTargets",
+      params: {},
+    });
+    assert.match(response.error.message, /Multiple Chrome extension profiles/);
+    cdp.close();
+  } finally {
+    first.close();
+    second.close();
+    await daemon.stop();
+  }
+});
+
 test("page takeover fences queued and future CDP commands and emits a bounded owner event", async () => {
   const port = await freePort();
   const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });

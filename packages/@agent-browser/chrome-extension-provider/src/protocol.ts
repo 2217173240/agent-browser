@@ -138,6 +138,7 @@ export type BridgeSession = {
   sessionId: string;
   token: string;
   profileId?: string;
+  profileUrlHint?: string;
   ownerSessionId?: string;
   createdAt: string;
 };

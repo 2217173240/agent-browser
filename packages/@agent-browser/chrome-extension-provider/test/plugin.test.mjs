@@ -42,8 +42,11 @@ test("plugin status reports offline daemon without failing", async () => {
 test("plugin launch returns a CDP URL after an extension profile connects", async () => {
   const port = await freePort();
   const oldPort = process.env.AGENT_BROWSER_CHROME_BRIDGE_PORT;
+  const oldProfileUrlHint = process.env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT;
   const oldOwnerSessionId = process.env.NEXOLYRA_AGENT_BROWSER_SESSION_ID;
   process.env.AGENT_BROWSER_CHROME_BRIDGE_PORT = String(port);
+  process.env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT =
+    "/session/674fb240-55e4-427e-a544-60c5b22226f0";
   process.env.NEXOLYRA_AGENT_BROWSER_SESSION_ID = "nex-aaaaaaaaaaaaaaaa";
   const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
@@ -75,6 +78,7 @@ test("plugin launch returns a CDP URL after an extension profile connects", asyn
     assert.equal(response.browser.cleanup.port, port);
     const health = await (await fetch(`http://127.0.0.1:${port}/health`)).json();
     assert.equal(health.sessions[0].ownerSessionId, "nex-aaaaaaaaaaaaaaaa");
+    assert.equal("profileUrlHint" in health.sessions[0], false);
 
     const close = await handlePluginRequest({
       protocol: "agent-browser.plugin.v1",
@@ -87,6 +91,7 @@ test("plugin launch returns a CDP URL after an extension profile connects", asyn
     extension.close();
     await daemon.stop();
     restoreEnv("AGENT_BROWSER_CHROME_BRIDGE_PORT", oldPort);
+    restoreEnv("AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT", oldProfileUrlHint);
     restoreEnv("NEXOLYRA_AGENT_BROWSER_SESSION_ID", oldOwnerSessionId);
   }
 });

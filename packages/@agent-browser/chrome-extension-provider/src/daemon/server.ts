@@ -176,11 +176,16 @@ export class BridgeDaemon {
   }
 
   /** Register one short-lived CDP entrypoint for a browser.provider launch. */
-  createBridgeSession(profileId?: string, ownerSessionId?: string): BridgeSession {
+  createBridgeSession(
+    profileId?: string,
+    ownerSessionId?: string,
+    profileUrlHint?: string,
+  ): BridgeSession {
     const session: BridgeSession = {
       sessionId: randomUUID(),
       token: randomBytes(24).toString("base64url"),
       profileId,
+      profileUrlHint,
       ownerSessionId,
       createdAt: new Date().toISOString(),
     };
@@ -216,11 +221,18 @@ export class BridgeDaemon {
       const body = await readJsonBody(req);
       const profileId =
         typeof body.profileId === "string" && body.profileId ? body.profileId : undefined;
+      const profileUrlHint = validProfileUrlHint(body.profileUrlHint);
+      if (body.profileUrlHint !== undefined && !profileUrlHint) {
+        this.writeJson(res, 400, {
+          error: "profileUrlHint must be a pathname suffix of at most 512 characters",
+        });
+        return;
+      }
       const ownerSessionId =
         typeof body.ownerSessionId === "string" && /^nex-[a-f0-9]{16}$/.test(body.ownerSessionId)
           ? body.ownerSessionId
           : undefined;
-      const session = this.createBridgeSession(profileId, ownerSessionId);
+      const session = this.createBridgeSession(profileId, ownerSessionId, profileUrlHint);
       this.writeJson(res, 200, session);
       return;
     }
@@ -733,6 +745,28 @@ export class BridgeDaemon {
   private trySelectProfile(session: BridgeSession): ProfilePeer | undefined {
     if (session.profileId) return this.profiles.get(session.profileId);
     if (this.profiles.size === 1) return [...this.profiles.values()][0];
+    if (session.profileUrlHint) {
+      const matching = [...this.profiles.values()].filter((peer) =>
+        [...peer.tabs.values()].some((tab) =>
+          tabMatchesProfileUrlHint(tab, session.profileUrlHint!),
+        ),
+      );
+      const activeMatching = matching.filter((peer) =>
+        [...peer.tabs.values()].some(
+          (tab) => tab.active && tabMatchesProfileUrlHint(tab, session.profileUrlHint!),
+        ),
+      );
+      const selected =
+        matching.length === 1
+          ? matching[0]
+          : activeMatching.length === 1
+            ? activeMatching[0]
+            : undefined;
+      if (selected) {
+        session.profileId = selected.profileId;
+        return selected;
+      }
+    }
     return undefined;
   }
 
@@ -896,6 +930,24 @@ export class BridgeDaemon {
 
 function tabsToMap(tabs: BridgeTab[]): Map<number, BridgeTab> {
   return new Map(tabs.map((tab) => [tab.tabId, tab]));
+}
+
+function validProfileUrlHint(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const hint = value.trim();
+  if (!hint.startsWith("/") || hint.length > 512 || /[\u0000-\u001f\u007f]/.test(hint)) {
+    return undefined;
+  }
+  return hint.length > 1 ? hint.replace(/\/+$/, "") : hint;
+}
+
+function tabMatchesProfileUrlHint(tab: BridgeTab, hint: string): boolean {
+  try {
+    const pathname = new URL(tab.url).pathname.replace(/\/+$/, "") || "/";
+    return pathname.endsWith(hint);
+  } catch {
+    return false;
+  }
 }
 
 function parseBridgeMessage(raw: WebSocket.RawData): BridgeMessage | null {

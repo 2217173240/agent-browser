@@ -5,6 +5,7 @@ export const DEFAULT_BRIDGE_PORT = 19826;
 export type BridgeConfig = {
   port: number;
   profileId?: string;
+  profileUrlHint?: string;
   daemonCommand?: string;
   extensionId?: string;
   logPath?: string;
@@ -14,6 +15,7 @@ export function readBridgeConfig(env: NodeJS.ProcessEnv = process.env): BridgeCo
   return {
     port: parsePort(env.AGENT_BROWSER_CHROME_BRIDGE_PORT),
     profileId: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE),
+    profileUrlHint: parseProfileUrlHint(env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT),
     daemonCommand: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_DAEMON),
     extensionId: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID),
     logPath: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_LOG),
@@ -29,6 +31,17 @@ export function parsePort(value: string | undefined): number {
     );
   }
   return port;
+}
+
+export function parseProfileUrlHint(value: string | undefined): string | undefined {
+  const hint = nonEmpty(value);
+  if (!hint) return undefined;
+  if (!hint.startsWith("/") || hint.length > 512 || /[\u0000-\u001f\u007f]/.test(hint)) {
+    throw new Error(
+      "AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT must be a pathname suffix of at most 512 characters",
+    );
+  }
+  return hint.length > 1 ? hint.replace(/\/+$/, "") : hint;
 }
 
 export function defaultDaemonScriptUrl(): URL {

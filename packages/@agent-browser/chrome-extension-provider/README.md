@@ -64,6 +64,7 @@ The status output includes the unpacked extension path, bridge protocol version,
   <tbody>
     <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_PORT</code></td><td>Local daemon port</td><td><code>19826</code></td></tr>
     <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_PROFILE</code></td><td>Profile id to use when multiple extension profiles are connected</td><td>Auto-selects when only one profile is connected</td></tr>
+    <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT</code></td><td>Private pathname suffix used to identify the owning profile when several profiles are connected</td><td>Unset; an explicit profile is still required when selection remains ambiguous</td></tr>
     <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_DAEMON</code></td><td>Override daemon executable path</td><td>Bundled daemon</td></tr>
     <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID</code></td><td>Allow only one extension id to connect</td><td>Any local bridge extension</td></tr>
     <tr><td><code>AGENT_BROWSER_CHROME_BRIDGE_LOG</code></td><td>Optional daemon log file</td><td>No file logging</td></tr>
