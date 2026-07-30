@@ -134,9 +134,25 @@ test("page takeover fences queued and future CDP commands and emits a bounded ow
       id: 20,
       sessionId: attached.result.sessionId,
       method: "Page.startScreencast",
-      params: { format: "jpeg", quality: 60 },
+      params: { format: "png", quality: 99, maxWidth: 1280, maxHeight: 720, everyNthFrame: 1 },
     });
     assert.equal(observer.error, undefined);
+    assert.deepEqual(
+      extension.commands.find((command) => command.method === "Page.startScreencast")?.params,
+      {
+        format: "jpeg",
+        quality: 60,
+        maxWidth: 640,
+        maxHeight: 360,
+        everyNthFrame: 6,
+      },
+    );
+    assert.ok(
+      extension.commands.some(
+        (command) => command.method === "Bridge.activateTab" && command.tabId === 101,
+      ),
+      "takeover should focus the controlled Chrome tab",
+    );
 
     const ack = await cdpCommand(cdp, {
       id: 21,
@@ -249,10 +265,12 @@ test("daemon routes CDP events only to the owning bridge session", async () => {
 
 async function connectExtension(port, profileId, tabs) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
+  ws.commands = [];
   await onceOpen(ws);
   ws.on("message", (raw) => {
     const message = JSON.parse(String(raw));
     if (message.kind !== "cdp-command") return;
+    ws.commands.push(message);
     if (message.method === "Bridge.createTab") {
       const tab = {
         tabId: 202,

@@ -73,6 +73,14 @@ type QueuedControlEvent = {
   createdAt: string;
 };
 
+const LIVE_SCREENCAST_PARAMS = {
+  format: "jpeg",
+  quality: 60,
+  maxWidth: 640,
+  maxHeight: 360,
+  everyNthFrame: 6,
+} as const;
+
 /** Local CDP shim that keeps browser automation in agent-browser core and forwards page commands to the extension. */
 export class BridgeDaemon {
   private readonly options: BridgeDaemonOptions;
@@ -466,6 +474,7 @@ export class BridgeDaemon {
         method: "Bridge.createTab",
         params: { url },
       });
+      this.markTabActive(peer, tab);
       peer.tabs.set(tab.tabId, tab);
       return { handled: true, result: { targetId: targetIdFor(peer.profileId, tab.tabId) } };
     }
@@ -499,6 +508,7 @@ export class BridgeDaemon {
         method: "Bridge.activateTab",
         params: { tabId: peerAndTab.tab.tabId },
       });
+      this.markTabActive(peerAndTab.peer, peerAndTab.tab);
       return { handled: true, result: {} };
     }
     if (method === "Target.closeTarget") {
@@ -549,7 +559,10 @@ export class BridgeDaemon {
       peer,
       {
         method: request.method as string,
-        params: request.params ?? {},
+        params:
+          request.method === "Page.startScreencast"
+            ? { ...request.params, ...LIVE_SCREENCAST_PARAMS }
+            : (request.params ?? {}),
         sessionId: session.sessionId,
         tabId: session.tabId,
       },
@@ -647,6 +660,20 @@ export class BridgeDaemon {
     const attached = [...this.attachedSessions.values()].filter(
       (entry) => entry.bridgeSessionId === session.sessionId,
     );
+    if (phase === "human") {
+      const focused =
+        attached.find(
+          (entry) => this.profiles.get(entry.profileId)?.tabs.get(entry.tabId)?.active,
+        ) ?? attached.at(-1);
+      const peer = focused ? this.profiles.get(focused.profileId) : undefined;
+      if (focused && peer?.ws.readyState === WebSocket.OPEN) {
+        this.sendBridgeNotification(peer, {
+          method: "Bridge.activateTab",
+          tabId: focused.tabId,
+          params: { tabId: focused.tabId },
+        });
+      }
+    }
     for (const entry of attached) {
       const peer = this.profiles.get(entry.profileId);
       if (!peer || peer.ws.readyState !== WebSocket.OPEN) {
@@ -727,6 +754,13 @@ export class BridgeDaemon {
       if (session.profileId === profileId && session.tabId === tabId) return true;
     }
     return false;
+  }
+
+  private markTabActive(peer: ProfilePeer, activeTab: BridgeTab): void {
+    for (const tab of peer.tabs.values()) {
+      if (tab.windowId === activeTab.windowId) tab.active = tab.tabId === activeTab.tabId;
+    }
+    activeTab.active = true;
   }
 
   private async sendBridgeCommand<T = unknown>(
