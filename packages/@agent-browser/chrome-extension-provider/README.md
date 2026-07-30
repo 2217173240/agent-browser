@@ -75,6 +75,8 @@ The extension connects to port `19826` by default. For a custom port, set `chrom
 
 When a host provides `AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT`, the bridge uses that private route only to find the owning Chrome profile. It does not expose the host tab to the agent. Instead, it creates non-focused task windows and limits the CDP session to tabs created for that session; human takeover focuses the exact controlled tab, and provider cleanup closes session-owned tabs.
 
+The unpacked extension requests access to all page origins because local automation and the Live viewport must work on the user's task pages without a per-origin installation step. Live remains event-driven through `Page.screencastFrame`; for a static or occluded task window, the provider seeds one viewport JPEG with `chrome.tabs.captureVisibleTab` and then returns to the CDP event stream.
+
 ## Limits
 
 The MVP targets ordinary web pages in desktop Chrome 120 or newer. It does not support `chrome://` pages, browser UI pages, automation of other extension pages, Chrome Web Store distribution, Native Messaging bootstrap, or capabilities that are already incomplete for external CDP sessions such as some recording flows.

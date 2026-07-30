@@ -172,6 +172,33 @@ async function executeCommand(command: BridgeCommand): Promise<unknown> {
     if (!tab) throw new Error("Chrome did not create a task tab");
     return tabToBridgeTab(tab);
   }
+  if (command.method === "Bridge.captureVisibleTab") {
+    const tabId = command.tabId ?? numberParam(command, "tabId");
+    const target = (await tabsQuery({})).find((candidate) => candidate.id === tabId);
+    if (!target || target.windowId === undefined) {
+      throw new Error(`Chrome task tab is unavailable: ${tabId}`);
+    }
+    if (!target.active) {
+      throw new Error("Chrome task tab is not active in its dedicated window");
+    }
+    const format = command.params?.format === "png" ? "png" : "jpeg";
+    const requestedQuality = command.params?.quality;
+    const quality =
+      typeof requestedQuality === "number"
+        ? Math.max(0, Math.min(100, Math.round(requestedQuality)))
+        : 60;
+    const dataUrl = await tabsCaptureVisibleTab(target.windowId, { format, quality });
+    const [activeAfterCapture] = await tabsQuery({
+      active: true,
+      windowId: target.windowId,
+    });
+    if (activeAfterCapture?.id !== tabId) {
+      throw new Error("Chrome task tab changed while capturing the Live frame");
+    }
+    const separator = dataUrl.indexOf(",");
+    if (separator < 0) throw new Error("Chrome returned an invalid captured frame");
+    return { data: dataUrl.slice(separator + 1) };
+  }
   if (command.method === "Bridge.activateTab") {
     const tabId = numberParam(command, "tabId");
     const tab = await tabsUpdate(tabId, { active: true });
@@ -446,6 +473,13 @@ function tabsUpdate(
 
 function tabsRemove(tabId: number): Promise<void> {
   return chromeCall((done) => chrome.tabs.remove(tabId, done));
+}
+
+function tabsCaptureVisibleTab(
+  windowId: number,
+  options: chrome.tabs.ImageDetails,
+): Promise<string> {
+  return chromeCall((done) => chrome.tabs.captureVisibleTab(windowId, options, done));
 }
 
 function windowsUpdate(

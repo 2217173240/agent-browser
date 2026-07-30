@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
@@ -95,6 +96,46 @@ pub(super) async fn cdp_event_loop(
                     "recording": rec,
                 });
                 let _ = frame_tx.send(status.to_string());
+
+                // A static page in an occluded/background Chrome window may not emit an
+                // initial Page.screencastFrame. Seed Live with one bounded viewport capture,
+                // but never delay the event stream for more than a short fallback window.
+                if supports_screencast {
+                    let capture = tokio::time::timeout(
+                        Duration::from_millis(1_500),
+                        client_arc.send_command(
+                            "Page.captureScreenshot",
+                            Some(json!({
+                                "format": "jpeg",
+                                "quality": 60,
+                                "fromSurface": true,
+                                "captureBeyondViewport": false,
+                            })),
+                            session_id.as_deref(),
+                        ),
+                    )
+                    .await;
+                    if let Ok(Ok(capture)) = capture {
+                        if let Some(data) = capture.get("data").and_then(|value| value.as_str()) {
+                            let msg = json!({
+                                "type": "frame",
+                                "data": data,
+                                "metadata": {
+                                    "offsetTop": 0.0,
+                                    "pageScaleFactor": 1.0,
+                                    "deviceWidth": vw,
+                                    "deviceHeight": vh,
+                                    "scrollOffsetX": 0.0,
+                                    "scrollOffsetY": 0.0,
+                                    "timestamp": timestamp_ms(),
+                                }
+                            });
+                            let msg_str = msg.to_string();
+                            *last_frame.write().await = Some(msg_str.clone());
+                            let _ = frame_tx.send(msg_str);
+                        }
+                    }
+                }
 
                 loop {
                     tokio::select! {

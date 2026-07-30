@@ -63,6 +63,7 @@ type PendingCommand = {
   cdpClient: WebSocket;
   cdpId: number;
   timeout: NodeJS.Timeout;
+  method: string;
   bridgeSessionId?: string;
 };
 
@@ -624,17 +625,35 @@ export class BridgeDaemon {
     if (!session) throw new Error(`Unknown sessionId: ${request.sessionId}`);
     const peer = this.profiles.get(session.profileId);
     if (!peer) throw new Error(`Profile is offline: ${session.profileId}`);
+    const captureParams = request.params ?? {};
+    const useVisibleCapture =
+      request.method === "Page.captureScreenshot" &&
+      captureParams.clip === undefined &&
+      captureParams.captureBeyondViewport !== true &&
+      (captureParams.format === undefined ||
+        captureParams.format === "jpeg" ||
+        captureParams.format === "png");
     await this.sendBridgeCommand(
       peer,
-      {
-        method: request.method as string,
-        params:
-          request.method === "Page.startScreencast"
-            ? { ...request.params, ...LIVE_SCREENCAST_PARAMS }
-            : (request.params ?? {}),
-        sessionId: session.sessionId,
-        tabId: session.tabId,
-      },
+      useVisibleCapture
+        ? {
+            method: "Bridge.captureVisibleTab",
+            params: {
+              format: captureParams.format,
+              quality: captureParams.quality,
+            },
+            sessionId: session.sessionId,
+            tabId: session.tabId,
+          }
+        : {
+            method: request.method as string,
+            params:
+              request.method === "Page.startScreencast"
+                ? { ...request.params, ...LIVE_SCREENCAST_PARAMS }
+                : captureParams,
+            sessionId: session.sessionId,
+            tabId: session.tabId,
+          },
       ws,
       request.id as number,
       bridgeSession.sessionId,
@@ -963,7 +982,13 @@ export class BridgeDaemon {
           cdpError(`Timed out waiting for extension response to ${payload.method}`),
         );
       }, this.options.commandTimeoutMs);
-      this.pending.set(reqId, { cdpClient, cdpId, timeout, bridgeSessionId });
+      this.pending.set(reqId, {
+        cdpClient,
+        cdpId,
+        timeout,
+        method: payload.method,
+        bridgeSessionId,
+      });
       peer.ws.send(JSON.stringify(payload));
       return undefined as T;
     }
@@ -976,6 +1001,7 @@ export class BridgeDaemon {
         cdpClient: resultSocket(resolve, reject),
         cdpId: 0,
         timeout,
+        method: payload.method,
       });
       peer.ws.send(JSON.stringify(payload));
     });
@@ -1002,6 +1028,12 @@ export class BridgeDaemon {
     if (!pending) return;
     clearTimeout(pending.timeout);
     this.pending.delete(message.reqId);
+    if (message.error) {
+      this.logger.error("Chrome extension command failed", {
+        method: pending.method,
+        error: message.error.message,
+      });
+    }
     if (pending.cdpId === 0 && isResultSocket(pending.cdpClient)) {
       if (message.error) {
         pending.cdpClient.reject(new Error(message.error.message));
@@ -1117,7 +1149,8 @@ function isObserverCdpMethod(method: string): boolean {
   return (
     method === "Page.startScreencast" ||
     method === "Page.stopScreencast" ||
-    method === "Page.screencastFrameAck"
+    method === "Page.screencastFrameAck" ||
+    method === "Page.captureScreenshot"
   );
 }
 

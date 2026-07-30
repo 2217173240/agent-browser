@@ -48,8 +48,29 @@ test("daemon validates CDP tokens and routes core CDP traffic through the extens
     });
     assert.equal(evaluated.result.result.value, "ok");
 
-    const closed = await cdpCommand(cdp, {
+    const captured = await cdpCommand(cdp, {
       id: 5,
+      sessionId: attached.result.sessionId,
+      method: "Page.captureScreenshot",
+      params: {
+        format: "jpeg",
+        quality: 60,
+        captureBeyondViewport: false,
+      },
+    });
+    assert.equal(captured.result.data, "base64-frame");
+    assert.ok(
+      extension.commands.some(
+        (command) =>
+          command.method === "Bridge.captureVisibleTab" &&
+          command.tabId === 202 &&
+          command.params.format === "jpeg" &&
+          command.params.quality === 60,
+      ),
+    );
+
+    const closed = await cdpCommand(cdp, {
+      id: 6,
       method: "Browser.close",
       params: {},
     });
@@ -476,6 +497,17 @@ async function connectExtension(port, profileId, tabs) {
           kind: "cdp-result",
           reqId: message.reqId,
           result: tab,
+        }),
+      );
+      return;
+    }
+    if (message.method === "Bridge.captureVisibleTab") {
+      ws.send(
+        JSON.stringify({
+          v: 1,
+          kind: "cdp-result",
+          reqId: message.reqId,
+          result: { data: "base64-frame" },
         }),
       );
       return;

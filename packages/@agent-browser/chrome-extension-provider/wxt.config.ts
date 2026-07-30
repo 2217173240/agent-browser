@@ -6,9 +6,8 @@ export default defineConfig({
     version: "0.31.1",
     minimum_chrome_version: "120",
     permissions: ["debugger", "tabs", "storage", "alarms"],
-    host_permissions: ["http://127.0.0.1/*"],
+    host_permissions: ["<all_urls>"],
     optional_permissions: ["scripting"],
-    optional_host_permissions: ["<all_urls>"],
     action: {
       default_title: "Agent Browser Bridge",
     },
