@@ -268,9 +268,13 @@ async fn handle_ws_client(
         }
     }
 
-    {
+    let remaining_clients = {
         let mut count = client_count.lock().await;
         *count = count.saturating_sub(1);
+        *count
+    };
+    if remaining_clients == 0 {
+        *last_frame.write().await = None;
     }
 
     client_notify.notify_one();

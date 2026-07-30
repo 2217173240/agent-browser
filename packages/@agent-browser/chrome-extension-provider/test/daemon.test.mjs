@@ -130,6 +130,22 @@ test("page takeover fences queued and future CDP commands and emits a bounded ow
     });
     assert.match(blocked.error.message, /held by the user/);
 
+    const observer = await cdpCommand(cdp, {
+      id: 20,
+      sessionId: attached.result.sessionId,
+      method: "Page.startScreencast",
+      params: { format: "jpeg", quality: 60 },
+    });
+    assert.equal(observer.error, undefined);
+
+    const ack = await cdpCommand(cdp, {
+      id: 21,
+      sessionId: attached.result.sessionId,
+      method: "Page.screencastFrameAck",
+      params: { sessionId: 1 },
+    });
+    assert.equal(ack.error, undefined);
+
     const events = await fetchJson(port, "/control/events?after=0");
     assert.equal(events.events[0].ownerSessionId, "nex-aaaaaaaaaaaaaaaa");
     assert.equal(events.events[0].action, "takeover");
@@ -147,6 +163,84 @@ test("page takeover fences queued and future CDP commands and emits a bounded ow
     });
     assert.equal(evaluated.result.result.value, "ok");
     cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
+test("daemon routes CDP events only to the owning bridge session", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://a.example", title: "A", active: true },
+    { tabId: 202, windowId: 1, url: "https://b.example", title: "B", active: false },
+  ]);
+
+  try {
+    const firstSession = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+    });
+    const secondSession = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-bbbbbbbbbbbbbbbb",
+    });
+    const first = await connectCdp(port, firstSession.sessionId, firstSession.token);
+    const second = await connectCdp(port, secondSession.sessionId, secondSession.token);
+    const firstAttached = await cdpCommand(first, {
+      id: 1,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:101", flatten: true },
+    });
+    const secondAttached = await cdpCommand(second, {
+      id: 2,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:202", flatten: true },
+    });
+    const firstEvents = [];
+    const secondEvents = [];
+    first.on("message", (raw) => {
+      const message = JSON.parse(String(raw));
+      if (message.method) firstEvents.push(message);
+    });
+    second.on("message", (raw) => {
+      const message = JSON.parse(String(raw));
+      if (message.method) secondEvents.push(message);
+    });
+
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "cdp-event",
+        profileId: "profile-a",
+        tabId: 101,
+        sessionId: firstAttached.result.sessionId,
+        method: "Page.screencastFrame",
+        params: { sessionId: 1, data: "first" },
+      }),
+    );
+    await waitFor(() => firstEvents.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(secondEvents.length, 0);
+    assert.equal(firstEvents[0].sessionId, firstAttached.result.sessionId);
+
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "cdp-event",
+        profileId: "profile-a",
+        tabId: 202,
+        sessionId: secondAttached.result.sessionId,
+        method: "Page.screencastFrame",
+        params: { sessionId: 2, data: "second" },
+      }),
+    );
+    await waitFor(() => secondEvents.length === 1);
+    assert.equal(firstEvents.length, 1);
+    assert.equal(secondEvents[0].sessionId, secondAttached.result.sessionId);
+
+    first.close();
+    second.close();
   } finally {
     extension.close();
     await daemon.stop();

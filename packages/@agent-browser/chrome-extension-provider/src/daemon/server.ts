@@ -86,7 +86,7 @@ export class BridgeDaemon {
   private readonly controlStates = new Map<string, ControlState>();
   private readonly controlEvents: QueuedControlEvent[] = [];
   private readonly pending = new Map<string, PendingCommand>();
-  private readonly cdpClients = new Set<WebSocket>();
+  private readonly cdpClients = new Map<WebSocket, string>();
   private attachSequence = 1;
   private commandSequence = 1;
   private controlEventSequence = 0;
@@ -133,7 +133,7 @@ export class BridgeDaemon {
       clearTimeout(pending.timeout);
     }
     this.pending.clear();
-    for (const client of this.cdpClients) {
+    for (const client of this.cdpClients.keys()) {
       client.close();
     }
     for (const peer of this.profiles.values()) {
@@ -360,7 +360,12 @@ export class BridgeDaemon {
   }
 
   private handleCdpConnection(ws: WebSocket, req: IncomingMessage) {
-    this.cdpClients.add(ws);
+    const bridgeSession = this.sessionFromRequest(req);
+    if (!bridgeSession) {
+      ws.close();
+      return;
+    }
+    this.cdpClients.set(ws, bridgeSession.sessionId);
     ws.on("message", (raw) => {
       const message = parseCdpRequest(raw);
       if (!message) {
@@ -515,7 +520,7 @@ export class BridgeDaemon {
       this.sendCdpResult(ws, request.id as number, {});
       return;
     }
-    this.assertAgentControl(bridgeSession);
+    this.assertControlAllows(bridgeSession, request.method as string);
     const attached = request.sessionId ? this.attachedSessions.get(request.sessionId) : undefined;
     if (!attached) {
       const peer = this.selectProfile(bridgeSession);
@@ -555,9 +560,21 @@ export class BridgeDaemon {
   }
 
   private assertAgentControl(session: BridgeSession): void {
+    this.assertControlAllows(session, "");
+  }
+
+  private assertControlAllows(session: BridgeSession, method: string): void {
     const state = this.controlStates.get(session.sessionId);
-    if (state?.phase === "human") throw new Error("Browser control is held by the user");
-    if (state?.phase === "stopped") throw new Error("Browser control is stopped");
+    if (state?.phase === "human" && !isObserverCdpMethod(method)) {
+      throw new Error("Browser control is held by the user");
+    }
+    if (
+      state?.phase === "stopped" &&
+      method !== "Page.stopScreencast" &&
+      method !== "Page.screencastFrameAck"
+    ) {
+      throw new Error("Browser control is stopped");
+    }
   }
 
   private async showControlOverlay(
@@ -797,23 +814,32 @@ export class BridgeDaemon {
     method: string,
     params: Record<string, unknown>,
   ) {
-    const resolvedSessionId =
-      sessionId ?? (tabId ? this.firstSessionForTab(profileId, tabId) : undefined);
-    const event = JSON.stringify({
-      method,
-      params,
-      ...(resolvedSessionId ? { sessionId: resolvedSessionId } : {}),
-    });
-    for (const client of this.cdpClients) {
-      client.send(event);
-    }
-  }
+    const attached = sessionId
+      ? [this.attachedSessions.get(sessionId)].filter((entry): entry is AttachedSession =>
+          Boolean(
+            entry &&
+            entry.profileId === profileId &&
+            (tabId === undefined || entry.tabId === tabId),
+          ),
+        )
+      : tabId === undefined
+        ? []
+        : [...this.attachedSessions.values()].filter(
+            (entry) => entry.profileId === profileId && entry.tabId === tabId,
+          );
 
-  private firstSessionForTab(profileId: string, tabId: number): string | undefined {
-    for (const session of this.attachedSessions.values()) {
-      if (session.profileId === profileId && session.tabId === tabId) return session.sessionId;
+    for (const entry of attached) {
+      const event = JSON.stringify({
+        method,
+        params,
+        sessionId: entry.sessionId,
+      });
+      for (const [client, bridgeSessionId] of this.cdpClients) {
+        if (bridgeSessionId === entry.bridgeSessionId && client.readyState === WebSocket.OPEN) {
+          client.send(event);
+        }
+      }
     }
-    return undefined;
   }
 
   private sendCdpResult(ws: WebSocket, id: number, result: unknown) {
@@ -857,6 +883,14 @@ function parseCdpRequest(raw: WebSocket.RawData): CdpRequest | null {
 function stringParam(params: Record<string, unknown> | undefined, key: string): string | undefined {
   const value = params?.[key];
   return typeof value === "string" ? value : undefined;
+}
+
+function isObserverCdpMethod(method: string): boolean {
+  return (
+    method === "Page.startScreencast" ||
+    method === "Page.stopScreencast" ||
+    method === "Page.screencastFrameAck"
+  );
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
