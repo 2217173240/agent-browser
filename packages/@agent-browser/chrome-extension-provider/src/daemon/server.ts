@@ -31,6 +31,7 @@ export type BridgeDaemonOptions = {
   allowedExtensionId?: string;
   logPath?: string;
   commandTimeoutMs?: number;
+  detachedTargetGraceMs?: number;
 };
 
 type ProfilePeer = {
@@ -50,6 +51,12 @@ type AttachedSession = {
 
 type SessionTargetScope = {
   targetIds: Set<string>;
+};
+
+type DetachedTargetScope = {
+  profileUrlHint: string;
+  scope: SessionTargetScope;
+  cleanupTimer: ReturnType<typeof setTimeout>;
 };
 
 type PendingCommand = {
@@ -97,6 +104,7 @@ export class BridgeDaemon {
   private readonly profiles = new Map<string, ProfilePeer>();
   private readonly bridgeSessions = new Map<string, BridgeSession>();
   private readonly sessionTargetScopes = new Map<string, SessionTargetScope>();
+  private readonly detachedTargetScopes = new Map<string, DetachedTargetScope>();
   private readonly attachedSessions = new Map<string, AttachedSession>();
   private readonly controlStates = new Map<string, ControlState>();
   private readonly controlEvents: QueuedControlEvent[] = [];
@@ -109,6 +117,7 @@ export class BridgeDaemon {
   constructor(options: BridgeDaemonOptions) {
     this.options = {
       commandTimeoutMs: 30_000,
+      detachedTargetGraceMs: 5_000,
       ...options,
     };
     this.logger = createLogger(options.logPath);
@@ -145,6 +154,13 @@ export class BridgeDaemon {
         await this.closeOwnedTargets(session);
       }),
     );
+    await Promise.all(
+      [...this.detachedTargetScopes.values()].map(async (detached) => {
+        clearTimeout(detached.cleanupTimer);
+        await this.closeTargetScope(detached.scope, "daemon-shutdown");
+      }),
+    );
+    this.detachedTargetScopes.clear();
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timeout);
     }
@@ -199,7 +215,14 @@ export class BridgeDaemon {
     };
     this.bridgeSessions.set(session.sessionId, session);
     if (profileUrlHint) {
-      this.sessionTargetScopes.set(session.sessionId, { targetIds: new Set() });
+      const detached = ownerSessionId ? this.detachedTargetScopes.get(ownerSessionId) : undefined;
+      if (detached?.profileUrlHint === profileUrlHint) {
+        clearTimeout(detached.cleanupTimer);
+        this.detachedTargetScopes.delete(ownerSessionId!);
+        this.sessionTargetScopes.set(session.sessionId, detached.scope);
+      } else {
+        this.sessionTargetScopes.set(session.sessionId, { targetIds: new Set() });
+      }
     }
     this.controlStates.set(session.sessionId, {
       phase: "agent",
@@ -213,10 +236,9 @@ export class BridgeDaemon {
     const session = this.bridgeSessions.get(sessionId);
     if (session) {
       await this.setBridgeControl(session, "stopped");
-      await this.closeOwnedTargets(session);
+      await this.releaseOwnedTargets(session);
     }
     const existed = this.bridgeSessions.delete(sessionId);
-    this.sessionTargetScopes.delete(sessionId);
     this.controlStates.delete(sessionId);
     for (const [attachedSessionId, attached] of this.attachedSessions) {
       if (attached.bridgeSessionId === sessionId) {
@@ -837,6 +859,43 @@ export class BridgeDaemon {
   private async closeOwnedTargets(session: BridgeSession): Promise<void> {
     const scope = this.sessionTargetScopes.get(session.sessionId);
     if (!scope) return;
+    await this.closeTargetScope(scope, session.sessionId);
+  }
+
+  private async releaseOwnedTargets(session: BridgeSession): Promise<void> {
+    const scope = this.sessionTargetScopes.get(session.sessionId);
+    if (!scope) return;
+    this.sessionTargetScopes.delete(session.sessionId);
+    if (
+      session.ownerSessionId &&
+      session.profileUrlHint &&
+      scope.targetIds.size > 0 &&
+      (this.options.detachedTargetGraceMs ?? 0) > 0
+    ) {
+      const ownerSessionId = session.ownerSessionId;
+      const previous = this.detachedTargetScopes.get(ownerSessionId);
+      if (previous) {
+        clearTimeout(previous.cleanupTimer);
+        void this.closeTargetScope(previous.scope, `${ownerSessionId}:superseded`);
+      }
+      const cleanupTimer = setTimeout(() => {
+        const detached = this.detachedTargetScopes.get(ownerSessionId);
+        if (!detached || detached.scope !== scope) return;
+        this.detachedTargetScopes.delete(ownerSessionId);
+        void this.closeTargetScope(scope, `${ownerSessionId}:grace-expired`);
+      }, this.options.detachedTargetGraceMs);
+      cleanupTimer.unref?.();
+      this.detachedTargetScopes.set(ownerSessionId, {
+        profileUrlHint: session.profileUrlHint,
+        scope,
+        cleanupTimer,
+      });
+      return;
+    }
+    await this.closeTargetScope(scope, session.sessionId);
+  }
+
+  private async closeTargetScope(scope: SessionTargetScope, owner: string): Promise<void> {
     for (const targetId of [...scope.targetIds]) {
       const ref = parseTargetId(targetId);
       const peer = ref ? this.profiles.get(ref.profileId) : undefined;
@@ -847,7 +906,7 @@ export class BridgeDaemon {
           params: { tabId: ref.tabId },
         }).catch((error) => {
           this.logger.error("failed to close session-owned Chrome tab", {
-            sessionId: session.sessionId,
+            owner,
             error: error instanceof Error ? error.message : String(error),
           });
         });

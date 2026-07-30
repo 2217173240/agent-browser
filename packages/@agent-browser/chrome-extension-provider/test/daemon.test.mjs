@@ -92,7 +92,11 @@ test("daemon requires an explicit profile when multiple extension profiles are c
 
 test("daemon selects the owning profile and isolates a host session in its own task window", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = new BridgeDaemon({
+    port,
+    commandTimeoutMs: 5000,
+    detachedTargetGraceMs: 50,
+  });
   await daemon.start();
   const unrelated = await connectExtension(port, "profile-a", [
     { tabId: 1, url: "https://work.example/session/other", title: "Other", active: true },
@@ -191,11 +195,38 @@ test("daemon selects the owning profile and isolates a host session in its own t
     );
 
     await postJson(port, `/sessions/${session.sessionId}/detach`, {});
+    assert.equal(
+      owning.commands.some((command) => command.method === "Bridge.closeTab"),
+      false,
+    );
+
+    const replacement = await postJson(port, "/sessions", {
+      profileUrlHint: "/session/674fb240-55e4-427e-a544-60c5b22226f0/",
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+    });
+    const replacementCdp = await connectCdp(port, replacement.sessionId, replacement.token);
+    const replacementTargets = await cdpCommand(replacementCdp, {
+      id: 6,
+      method: "Target.getTargets",
+      params: {},
+    });
+    assert.deepEqual(
+      replacementTargets.result.targetInfos.map((target) => target.url),
+      ["https://example.com/task"],
+    );
+
+    await postJson(port, `/sessions/${replacement.sessionId}/detach`, {});
+    await waitFor(() =>
+      owning.commands.some(
+        (command) => command.method === "Bridge.closeTab" && command.params.tabId === 303,
+      ),
+    );
     assert.ok(
       owning.commands.some(
         (command) => command.method === "Bridge.closeTab" && command.params.tabId === 303,
       ),
     );
+    replacementCdp.close();
     cdp.close();
   } finally {
     unrelated.close();
