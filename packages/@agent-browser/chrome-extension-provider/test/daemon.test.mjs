@@ -179,6 +179,17 @@ test("daemon selects the owning profile and isolates a host session in its own t
       false,
     );
 
+    const browserClose = await cdpCommand(cdp, {
+      id: 5,
+      method: "Browser.close",
+      params: {},
+    });
+    assert.equal(browserClose.error, undefined);
+    assert.equal(
+      owning.commands.some((command) => command.method === "Bridge.closeTab"),
+      false,
+    );
+
     await postJson(port, `/sessions/${session.sessionId}/detach`, {});
     assert.ok(
       owning.commands.some(

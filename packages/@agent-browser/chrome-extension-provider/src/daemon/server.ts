@@ -465,7 +465,8 @@ export class BridgeDaemon {
       };
     }
     if (method === "Browser.close") {
-      await this.closeOwnedTargets(bridgeSession);
+      // agent-browser may issue this while recycling its CDP background client.
+      // The authenticated provider detach route owns task-tab cleanup.
       return { handled: true, result: {} };
     }
     if (method === "Target.setDiscoverTargets") {
