@@ -202,7 +202,13 @@ async function executeCommand(command: BridgeCommand): Promise<unknown> {
   if (command.method === "Bridge.activateTab") {
     const tabId = numberParam(command, "tabId");
     const tab = await tabsUpdate(tabId, { active: true });
-    if (tab.windowId !== undefined) await windowsUpdate(tab.windowId, { focused: true });
+    if (tab.windowId === undefined) throw new Error(`Chrome task window is unavailable: ${tabId}`);
+    await windowsUpdate(tab.windowId, { focused: true });
+    const [activeTab] = await tabsQuery({ active: true, windowId: tab.windowId });
+    const focusedWindow = await windowsGet(tab.windowId);
+    if (activeTab?.id !== tabId || focusedWindow.focused !== true) {
+      throw new Error("Chrome did not focus the exact controlled task tab");
+    }
     return {};
   }
   if (command.method === "Bridge.closeTab") {
@@ -487,6 +493,10 @@ function windowsUpdate(
   updateInfo: chrome.windows.UpdateInfo,
 ): Promise<chrome.windows.Window> {
   return chromeCall((done) => chrome.windows.update(windowId, updateInfo, done));
+}
+
+function windowsGet(windowId: number): Promise<chrome.windows.Window> {
+  return chromeCall((done) => chrome.windows.get(windowId, done));
 }
 
 function windowsCreate(createData: chrome.windows.CreateData): Promise<chrome.windows.Window> {

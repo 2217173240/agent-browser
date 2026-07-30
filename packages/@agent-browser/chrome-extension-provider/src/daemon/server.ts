@@ -755,7 +755,9 @@ export class BridgeDaemon {
         ) ?? attached.at(-1);
       const peer = focused ? this.profiles.get(focused.profileId) : undefined;
       if (focused && peer?.ws.readyState === WebSocket.OPEN) {
-        this.sendBridgeNotification(peer, {
+        // Human takeover is not acknowledged to the host until Chrome has
+        // confirmed that the exact controlled tab and its window were focused.
+        await this.sendBridgeCommand(peer, {
           method: "Bridge.activateTab",
           tabId: focused.tabId,
           params: { tabId: focused.tabId },
