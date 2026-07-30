@@ -42,6 +42,8 @@ export default defineBackground(() => {
   });
   chrome.tabs.onCreated.addListener(() => scheduleHeartbeat());
   chrome.tabs.onUpdated.addListener(() => scheduleHeartbeat());
+  chrome.tabs.onActivated.addListener(() => scheduleHeartbeat());
+  chrome.windows.onFocusChanged.addListener(() => scheduleHeartbeat());
   chrome.tabs.onRemoved.addListener((tabId) => {
     const overlay = controlOverlays.get(tabId);
     if (overlay && overlay.phase !== "stopped") {
@@ -158,6 +160,16 @@ async function executeCommand(command: BridgeCommand): Promise<unknown> {
   if (command.method === "Bridge.createTab") {
     const url = typeof command.params?.url === "string" ? command.params.url : "about:blank";
     const tab = await tabsCreate({ url, active: true });
+    return tabToBridgeTab(tab);
+  }
+  if (command.method === "Bridge.createWindow") {
+    const url = typeof command.params?.url === "string" ? command.params.url : "about:blank";
+    const focused = command.params?.focused === true;
+    const window = await windowsCreate({ url, focused });
+    const tab =
+      window.tabs?.[0] ??
+      (window.id === undefined ? undefined : (await tabsQuery({ windowId: window.id }))[0]);
+    if (!tab) throw new Error("Chrome did not create a task tab");
     return tabToBridgeTab(tab);
   }
   if (command.method === "Bridge.activateTab") {
@@ -441,6 +453,10 @@ function windowsUpdate(
   updateInfo: chrome.windows.UpdateInfo,
 ): Promise<chrome.windows.Window> {
   return chromeCall((done) => chrome.windows.update(windowId, updateInfo, done));
+}
+
+function windowsCreate(createData: chrome.windows.CreateData): Promise<chrome.windows.Window> {
+  return chromeCall((done) => chrome.windows.create(createData, done));
 }
 
 function debuggerAttach(target: chrome.debugger.Debuggee, version: string): Promise<void> {

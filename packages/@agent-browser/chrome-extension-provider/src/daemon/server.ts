@@ -48,6 +48,10 @@ type AttachedSession = {
   tabId: number;
 };
 
+type SessionTargetScope = {
+  targetIds: Set<string>;
+};
+
 type PendingCommand = {
   cdpClient: WebSocket;
   cdpId: number;
@@ -92,6 +96,7 @@ export class BridgeDaemon {
   private readonly cdpWss = new WebSocketServer({ noServer: true });
   private readonly profiles = new Map<string, ProfilePeer>();
   private readonly bridgeSessions = new Map<string, BridgeSession>();
+  private readonly sessionTargetScopes = new Map<string, SessionTargetScope>();
   private readonly attachedSessions = new Map<string, AttachedSession>();
   private readonly controlStates = new Map<string, ControlState>();
   private readonly controlEvents: QueuedControlEvent[] = [];
@@ -135,9 +140,10 @@ export class BridgeDaemon {
 
   async stop(): Promise<void> {
     await Promise.all(
-      [...this.bridgeSessions.values()].map((session) =>
-        this.setBridgeControl(session, "stopped").catch(() => undefined),
-      ),
+      [...this.bridgeSessions.values()].map(async (session) => {
+        await this.setBridgeControl(session, "stopped").catch(() => undefined);
+        await this.closeOwnedTargets(session);
+      }),
     );
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timeout);
@@ -192,6 +198,9 @@ export class BridgeDaemon {
       createdAt: new Date().toISOString(),
     };
     this.bridgeSessions.set(session.sessionId, session);
+    if (profileUrlHint) {
+      this.sessionTargetScopes.set(session.sessionId, { targetIds: new Set() });
+    }
     this.controlStates.set(session.sessionId, {
       phase: "agent",
       epoch: 1,
@@ -202,8 +211,12 @@ export class BridgeDaemon {
 
   async detachBridgeSession(sessionId: string): Promise<boolean> {
     const session = this.bridgeSessions.get(sessionId);
-    if (session) await this.setBridgeControl(session, "stopped");
+    if (session) {
+      await this.setBridgeControl(session, "stopped");
+      await this.closeOwnedTargets(session);
+    }
     const existed = this.bridgeSessions.delete(sessionId);
+    this.sessionTargetScopes.delete(sessionId);
     this.controlStates.delete(sessionId);
     for (const [attachedSessionId, attached] of this.attachedSessions) {
       if (attached.bridgeSessionId === sessionId) {
@@ -452,6 +465,7 @@ export class BridgeDaemon {
       };
     }
     if (method === "Browser.close") {
+      await this.closeOwnedTargets(bridgeSession);
       return { handled: true, result: {} };
     }
     if (method === "Target.setDiscoverTargets") {
@@ -465,7 +479,7 @@ export class BridgeDaemon {
       return {
         handled: true,
         result: {
-          targetInfos: [...peer.tabs.values()]
+          targetInfos: this.tabsForSession(bridgeSession, peer)
             .filter(shouldExposeTab)
             .map((tab) =>
               targetInfoFor(
@@ -484,18 +498,30 @@ export class BridgeDaemon {
       if (!isAutomatableUrl(url)) {
         throw new Error(`The Chrome extension bridge cannot automate this URL: ${url}`);
       }
-      const tab = await this.sendBridgeCommand<BridgeTab>(peer, {
-        method: "Bridge.createTab",
-        params: { url },
-      });
+      const scoped = this.sessionTargetScopes.has(bridgeSession.sessionId);
+      const tab = await this.sendBridgeCommand<BridgeTab>(
+        peer,
+        scoped
+          ? {
+              method: "Bridge.createWindow",
+              params: { url, focused: false },
+            }
+          : {
+              method: "Bridge.createTab",
+              params: { url },
+            },
+      );
       this.markTabActive(peer, tab);
       peer.tabs.set(tab.tabId, tab);
-      return { handled: true, result: { targetId: targetIdFor(peer.profileId, tab.tabId) } };
+      const targetId = targetIdFor(peer.profileId, tab.tabId);
+      this.sessionTargetScopes.get(bridgeSession.sessionId)?.targetIds.add(targetId);
+      return { handled: true, result: { targetId } };
     }
     if (method === "Target.attachToTarget") {
       this.assertAgentControl(bridgeSession);
       const targetId = stringParam(request.params, "targetId");
       if (!targetId) throw new Error("Target.attachToTarget requires targetId");
+      this.assertTargetAllowed(bridgeSession, targetId);
       const ref = parseTargetId(targetId);
       if (!ref) throw new Error(`Unknown targetId: ${targetId}`);
       const peer = this.profiles.get(ref.profileId);
@@ -517,6 +543,7 @@ export class BridgeDaemon {
     if (method === "Target.activateTarget") {
       this.assertAgentControl(bridgeSession);
       const targetId = stringParam(request.params, "targetId");
+      this.assertTargetAllowed(bridgeSession, targetId);
       const peerAndTab = this.peerAndTabFromTargetId(targetId);
       await this.sendBridgeCommand(peerAndTab.peer, {
         method: "Bridge.activateTab",
@@ -528,12 +555,17 @@ export class BridgeDaemon {
     if (method === "Target.closeTarget") {
       this.assertAgentControl(bridgeSession);
       const targetId = stringParam(request.params, "targetId");
+      this.assertTargetAllowed(bridgeSession, targetId);
       const peerAndTab = this.peerAndTabFromTargetId(targetId);
       await this.sendBridgeCommand(peerAndTab.peer, {
         method: "Bridge.closeTab",
         params: { tabId: peerAndTab.tab.tabId },
       });
       peerAndTab.peer.tabs.delete(peerAndTab.tab.tabId);
+      if (targetId) {
+        this.sessionTargetScopes.get(bridgeSession.sessionId)?.targetIds.delete(targetId);
+      }
+      this.deleteAttachedSessionsForTab(peerAndTab.peer.profileId, peerAndTab.tab.tabId);
       return { handled: true, result: { success: true } };
     }
     return { handled: false };
@@ -548,9 +580,9 @@ export class BridgeDaemon {
     const attached = request.sessionId ? this.attachedSessions.get(request.sessionId) : undefined;
     if (!attached) {
       const peer = this.selectProfile(bridgeSession);
+      const tabs = this.tabsForSession(bridgeSession, peer);
       const activeTab =
-        [...peer.tabs.values()].find((tab) => tab.active && shouldExposeTab(tab)) ??
-        [...peer.tabs.values()].find(shouldExposeTab);
+        tabs.find((tab) => tab.active && shouldExposeTab(tab)) ?? tabs.find(shouldExposeTab);
       if (!activeTab) throw new Error("No automatable tab is available");
       const sessionId = sessionIdFor(activeTab.tabId, this.attachSequence++);
       this.attachedSessions.set(sessionId, {
@@ -783,6 +815,54 @@ export class BridgeDaemon {
     const tab = peer?.tabs.get(ref.tabId);
     if (!peer || !tab) throw new Error(`Target is not available: ${targetId}`);
     return { peer, tab };
+  }
+
+  private tabsForSession(session: BridgeSession, peer: ProfilePeer): BridgeTab[] {
+    const scope = this.sessionTargetScopes.get(session.sessionId);
+    if (!scope) return [...peer.tabs.values()];
+    return [...scope.targetIds]
+      .map((targetId) => parseTargetId(targetId))
+      .filter((ref) => ref?.profileId === peer.profileId)
+      .map((ref) => peer.tabs.get(ref!.tabId))
+      .filter((tab): tab is BridgeTab => Boolean(tab));
+  }
+
+  private assertTargetAllowed(session: BridgeSession, targetId: string | undefined): void {
+    const scope = this.sessionTargetScopes.get(session.sessionId);
+    if (!scope || (targetId && scope.targetIds.has(targetId))) return;
+    throw new Error("Target is outside this Chrome bridge session");
+  }
+
+  private async closeOwnedTargets(session: BridgeSession): Promise<void> {
+    const scope = this.sessionTargetScopes.get(session.sessionId);
+    if (!scope) return;
+    for (const targetId of [...scope.targetIds]) {
+      const ref = parseTargetId(targetId);
+      const peer = ref ? this.profiles.get(ref.profileId) : undefined;
+      const tab = ref ? peer?.tabs.get(ref.tabId) : undefined;
+      if (ref && peer && tab) {
+        await this.sendBridgeCommand(peer, {
+          method: "Bridge.closeTab",
+          params: { tabId: ref.tabId },
+        }).catch((error) => {
+          this.logger.error("failed to close session-owned Chrome tab", {
+            sessionId: session.sessionId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+        peer.tabs.delete(ref.tabId);
+        this.deleteAttachedSessionsForTab(ref.profileId, ref.tabId);
+      }
+      scope.targetIds.delete(targetId);
+    }
+  }
+
+  private deleteAttachedSessionsForTab(profileId: string, tabId: number): void {
+    for (const [sessionId, attached] of this.attachedSessions) {
+      if (attached.profileId === profileId && attached.tabId === tabId) {
+        this.attachedSessions.delete(sessionId);
+      }
+    }
   }
 
   private hasAttachedSession(profileId: string, tabId: number): boolean {

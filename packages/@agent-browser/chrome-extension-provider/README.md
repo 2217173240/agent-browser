@@ -73,6 +73,8 @@ The status output includes the unpacked extension path, bridge protocol version,
 
 The extension connects to port `19826` by default. For a custom port, set `chrome.storage.local.bridgePort` or `chrome.storage.local.bridgePorts` in the extension profile to match `AGENT_BROWSER_CHROME_BRIDGE_PORT`.
 
+When a host provides `AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT`, the bridge uses that private route only to find the owning Chrome profile. It does not expose the host tab to the agent. Instead, it creates non-focused task windows and limits the CDP session to tabs created for that session; human takeover focuses the exact controlled tab, and provider cleanup closes session-owned tabs.
+
 ## Limits
 
 The MVP targets ordinary web pages in desktop Chrome 120 or newer. It does not support `chrome://` pages, browser UI pages, automation of other extension pages, Chrome Web Store distribution, Native Messaging bootstrap, or capabilities that are already incomplete for external CDP sessions such as some recording flows.

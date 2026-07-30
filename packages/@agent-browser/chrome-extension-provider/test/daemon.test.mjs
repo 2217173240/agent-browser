@@ -90,7 +90,7 @@ test("daemon requires an explicit profile when multiple extension profiles are c
   }
 });
 
-test("daemon selects the unique Chrome profile containing the host session route", async () => {
+test("daemon selects the owning profile and isolates a host session in its own task window", async () => {
   const port = await freePort();
   const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
   await daemon.start();
@@ -109,6 +109,7 @@ test("daemon selects the unique Chrome profile containing the host session route
   try {
     const session = await postJson(port, "/sessions", {
       profileUrlHint: "/session/674fb240-55e4-427e-a544-60c5b22226f0/",
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
     });
     const cdp = await connectCdp(port, session.sessionId, session.token);
     const response = await cdpCommand(cdp, {
@@ -117,13 +118,73 @@ test("daemon selects the unique Chrome profile containing the host session route
       params: {},
     });
     assert.equal(response.error, undefined);
+    assert.deepEqual(response.result.targetInfos, []);
+
+    const denied = await cdpCommand(cdp, {
+      id: 20,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-b:2", flatten: true },
+    });
+    assert.match(denied.error.message, /outside this Chrome bridge session/);
+
+    const created = await cdpCommand(cdp, {
+      id: 2,
+      method: "Target.createTarget",
+      params: { url: "https://example.com/task" },
+    });
+    assert.equal(created.error, undefined);
+    assert.equal(created.result.targetId, "tab:profile-b:303");
+    assert.ok(
+      owning.commands.some(
+        (command) =>
+          command.method === "Bridge.createWindow" &&
+          command.params.url === "https://example.com/task" &&
+          command.params.focused === false,
+      ),
+    );
+
+    const attached = await cdpCommand(cdp, {
+      id: 3,
+      method: "Target.attachToTarget",
+      params: { targetId: created.result.targetId, flatten: true },
+    });
+    assert.match(attached.result.sessionId, /^session:/);
+
+    const targets = await cdpCommand(cdp, {
+      id: 4,
+      method: "Target.getTargets",
+      params: {},
+    });
     assert.deepEqual(
-      response.result.targetInfos.map((target) => target.url),
-      ["http://127.0.0.1:3458/workspace/it/session/674fb240-55e4-427e-a544-60c5b22226f0/"],
+      targets.result.targetInfos.map((target) => target.url),
+      ["https://example.com/task"],
     );
     const health = await fetchJson(port, "/health");
     assert.equal(health.sessions[0].profileId, "profile-b");
     assert.equal("profileUrlHint" in health.sessions[0], false);
+
+    const takeover = await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", {
+      phase: "human",
+    });
+    assert.equal(takeover.matched, 1);
+    assert.ok(
+      owning.commands.some(
+        (command) => command.method === "Bridge.activateTab" && command.tabId === 303,
+      ),
+    );
+    assert.equal(
+      owning.commands.some(
+        (command) => command.method === "Bridge.activateTab" && command.tabId === 2,
+      ),
+      false,
+    );
+
+    await postJson(port, `/sessions/${session.sessionId}/detach`, {});
+    assert.ok(
+      owning.commands.some(
+        (command) => command.method === "Bridge.closeTab" && command.params.tabId === 303,
+      ),
+    );
     cdp.close();
   } finally {
     unrelated.close();
@@ -347,6 +408,24 @@ async function connectExtension(port, profileId, tabs) {
         windowId: 1,
         url: message.params.url,
         title: "Created",
+        active: true,
+      };
+      ws.send(
+        JSON.stringify({
+          v: 1,
+          kind: "cdp-result",
+          reqId: message.reqId,
+          result: tab,
+        }),
+      );
+      return;
+    }
+    if (message.method === "Bridge.createWindow") {
+      const tab = {
+        tabId: 303,
+        windowId: 99,
+        url: message.params.url,
+        title: "Task",
         active: true,
       };
       ws.send(
