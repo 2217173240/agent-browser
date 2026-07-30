@@ -214,7 +214,7 @@ test("page takeover fences queued and future CDP commands and emits a bounded ow
         quality: 60,
         maxWidth: 640,
         maxHeight: 360,
-        everyNthFrame: 6,
+        everyNthFrame: 1,
       },
     );
     assert.ok(

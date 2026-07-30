@@ -78,7 +78,9 @@ const LIVE_SCREENCAST_PARAMS = {
   quality: 60,
   maxWidth: 640,
   maxHeight: 360,
-  everyNthFrame: 6,
+  // A static page may not produce a second compositor frame. Keep the first frame observable;
+  // downstream viewers are responsible for dropping frames under backpressure.
+  everyNthFrame: 1,
 } as const;
 
 /** Local CDP shim that keeps browser automation in agent-browser core and forwards page commands to the extension. */
