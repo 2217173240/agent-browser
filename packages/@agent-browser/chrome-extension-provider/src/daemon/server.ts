@@ -874,6 +874,7 @@ export class BridgeDaemon {
       request.method === "Page.captureScreenshot" &&
       captureParams.clip === undefined &&
       captureParams.captureBeyondViewport !== true &&
+      captureParams.fromSurface !== true &&
       (captureParams.format === undefined ||
         captureParams.format === "jpeg" ||
         captureParams.format === "png");
