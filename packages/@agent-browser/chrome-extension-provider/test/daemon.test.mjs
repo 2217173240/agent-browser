@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:net";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import WebSocket from "ws";
 import { BridgeDaemon } from "../dist/daemon/server.js";
@@ -586,6 +589,84 @@ test("reconnect accepts an explicit target from another connected Chrome profile
   }
 });
 
+test("lists redacted reconnect targets without leaking page content or other ownership", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    {
+      tabId: 101,
+      windowId: 1,
+      url: "https://private.example/account?token=secret",
+      title: "Private account secret",
+      active: true,
+    },
+    {
+      tabId: 202,
+      windowId: 1,
+      url: "https://other.example/dashboard?password=secret",
+      title: "Other secret",
+      active: false,
+    },
+  ]);
+
+  try {
+    const first = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+    });
+    const second = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-bbbbbbbbbbbbbbbb",
+    });
+    const cdp = await connectCdp(port, second.sessionId, second.token);
+    const attached = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:202", flatten: true },
+    });
+    assert.equal(attached.error, undefined);
+
+    const response = await fetchJson(
+      port,
+      "/control/sessions/nex-aaaaaaaaaaaaaaaa/targets",
+    );
+    assert.equal(response.targets.length, 2);
+    assert.deepEqual(response.targets[0], {
+      targetId: "tab:profile-a:101",
+      profileId: "profile-a",
+      active: true,
+      available: true,
+      controlled: false,
+      controlledByOwner: false,
+      host: "private.example",
+      path: "/account",
+    });
+    assert.deepEqual(response.targets[1], {
+      targetId: "tab:profile-a:202",
+      profileId: "profile-a",
+      active: false,
+      available: false,
+      controlled: true,
+      controlledByOwner: false,
+      host: "other.example",
+      path: "/dashboard",
+    });
+    assert.equal(JSON.stringify(response).includes("secret"), false);
+    assert.equal(JSON.stringify(response).includes("Private account"), false);
+
+    const sameOwner = await fetchJson(
+      port,
+      "/control/sessions/nex-bbbbbbbbbbbbbbbb/targets",
+    );
+    assert.equal(sameOwner.targets[1].available, true);
+    assert.equal(sameOwner.targets[1].controlledByOwner, true);
+    assert.notEqual(first.sessionId, second.sessionId);
+    cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
 test("a full tab snapshot turns a silently closed browser into a recoverable detach", async () => {
   const port = await freePort();
   const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
@@ -648,6 +729,77 @@ test("a full tab snapshot turns a silently closed browser into a recoverable det
   } finally {
     extension.close();
     await daemon.stop();
+  }
+});
+
+test("daemon restart rehydrates an owner session and preserves its bridge token", async () => {
+  const root = mkdtempSync(join(tmpdir(), "agent-browser-bridge-state-"));
+  const statePath = join(root, "sessions.json");
+  const firstPort = await freePort();
+  const firstDaemon = new BridgeDaemon({
+    port: firstPort,
+    commandTimeoutMs: 5000,
+    statePath,
+  });
+  await firstDaemon.start();
+  const firstExtension = await connectExtension(firstPort, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
+  ]);
+
+  try {
+    const session = await postJson(firstPort, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+    });
+    const cdp = await connectCdp(firstPort, session.sessionId, session.token);
+    const attached = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:101", flatten: true },
+    });
+    const attachmentId = attached.result.sessionId;
+    await firstDaemon.shutdown();
+    firstExtension.close();
+    cdp.close();
+
+    const secondPort = await freePort();
+    const secondDaemon = new BridgeDaemon({
+      port: secondPort,
+      commandTimeoutMs: 5000,
+      statePath,
+    });
+    await secondDaemon.start();
+    const secondExtension = await connectExtension(secondPort, "profile-a", [
+      { tabId: 101, windowId: 1, url: "https://example.com/restarted", title: "Example", active: true },
+    ]);
+    try {
+      const health = await fetchJson(secondPort, "/health");
+      assert.equal(health.sessions[0].sessionId, session.sessionId);
+      assert.equal(health.sessions[0].control.phase, "detached");
+      const reconnected = await postJson(
+        secondPort,
+        "/control/sessions/nex-aaaaaaaaaaaaaaaa/reconnect",
+        {},
+      );
+      assert.equal(reconnected.attached, true);
+      assert.equal(reconnected.sessionId, attachmentId);
+      assert.equal(reconnected.targetId, "tab:profile-a:101");
+      const rehydratedCdp = await connectCdp(secondPort, session.sessionId, session.token);
+      const evaluated = await cdpCommand(rehydratedCdp, {
+        id: 2,
+        sessionId: attachmentId,
+        method: "Runtime.evaluate",
+        params: { expression: "document.title" },
+      });
+      assert.equal(evaluated.result.result.value, "ok");
+      rehydratedCdp.close();
+    } finally {
+      secondExtension.close();
+      await secondDaemon.stop();
+    }
+  } finally {
+    firstExtension.close();
+    await firstDaemon.stop().catch(() => undefined);
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

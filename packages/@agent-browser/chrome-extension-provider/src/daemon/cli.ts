@@ -7,10 +7,11 @@ const daemon = new BridgeDaemon({
   port: config.port,
   allowedExtensionId: config.extensionId,
   logPath: config.logPath,
+  statePath: config.statePath,
 });
 
 const shutdown = async () => {
-  await daemon.stop();
+  await daemon.shutdown();
   process.exit(0);
 };
 

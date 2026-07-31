@@ -1,6 +1,15 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import type { Duplex } from "node:stream";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname } from "node:path";
 import { URL } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import {
@@ -33,6 +42,8 @@ export type BridgeDaemonOptions = {
   logPath?: string;
   commandTimeoutMs?: number;
   detachedTargetGraceMs?: number;
+  statePath?: string;
+  sessionRetentionMs?: number;
 };
 
 type ProfilePeer = {
@@ -83,6 +94,20 @@ type ControlState = {
   updatedAt: string;
 };
 
+type PersistedBridgeSession = {
+  schemaVersion: 1;
+  session: BridgeSession;
+  control: ControlState;
+  targetIds: string[];
+  detachedAttachment?: DetachedAttachment;
+  savedAt: string;
+};
+
+type PersistedBridgeState = {
+  schemaVersion: 1;
+  sessions: PersistedBridgeSession[];
+};
+
 type QueuedControlEvent = {
   sequence: number;
   ownerSessionId: string;
@@ -94,6 +119,17 @@ type QueuedControlEvent = {
   createdAt: string;
 };
 
+export type BridgeReconnectTarget = {
+  targetId: string;
+  profileId: string;
+  active: boolean;
+  available: boolean;
+  controlled: boolean;
+  controlledByOwner: boolean;
+  host: string | null;
+  path: string | null;
+};
+
 const LIVE_SCREENCAST_PARAMS = {
   format: "jpeg",
   quality: 60,
@@ -103,6 +139,8 @@ const LIVE_SCREENCAST_PARAMS = {
   // downstream viewers are responsible for dropping frames under backpressure.
   everyNthFrame: 1,
 } as const;
+
+const DEFAULT_SESSION_RETENTION_MS = 30 * 60 * 1_000;
 
 /** Local CDP shim that keeps browser automation in agent-browser core and forwards page commands to the extension. */
 export class BridgeDaemon {
@@ -129,8 +167,10 @@ export class BridgeDaemon {
     this.options = {
       commandTimeoutMs: 30_000,
       detachedTargetGraceMs: 5_000,
+      sessionRetentionMs: DEFAULT_SESSION_RETENTION_MS,
       ...options,
     };
+    this.loadPersistedSessions();
     this.logger = createLogger(options.logPath);
     this.server = createServer((req, res) => {
       void this.handleHttp(req, res);
@@ -165,6 +205,11 @@ export class BridgeDaemon {
         await this.closeOwnedTargets(session);
       }),
     );
+    this.persistSessions();
+    await this.closeTransport();
+  }
+
+  private async closeTransport(): Promise<void> {
     await Promise.all(
       [...this.detachedTargetScopes.values()].map(async (detached) => {
         clearTimeout(detached.cleanupTimer);
@@ -184,7 +229,39 @@ export class BridgeDaemon {
     }
     await new Promise<void>((resolve) => this.extensionWss.close(() => resolve()));
     await new Promise<void>((resolve) => this.cdpWss.close(() => resolve()));
-    await new Promise<void>((resolve) => this.server.close(() => resolve()));
+    await new Promise<void>((resolve) => {
+      if (!this.server.listening) {
+        resolve();
+        return;
+      }
+      this.server.close(() => resolve());
+    });
+  }
+
+  /**
+   * Stop only the disposable daemon transport. User-owned sessions remain in
+   * a recoverable detached phase so a later daemon instance can reconnect to
+   * the extension without inventing a new bridge token.
+   */
+  async shutdown(): Promise<void> {
+    for (const session of this.bridgeSessions.values()) {
+      const current = this.controlStates.get(session.sessionId);
+      if (current?.phase === "stopped") continue;
+      const attached = [...this.attachedSessions.values()].filter(
+        (entry) => entry.bridgeSessionId === session.sessionId,
+      );
+      if (attached.length > 0) {
+        this.detachedAttachments.set(session.sessionId, attached[attached.length - 1]);
+        for (const entry of attached) this.attachedSessions.delete(entry.sessionId);
+      }
+      this.controlStates.set(session.sessionId, {
+        phase: "detached",
+        epoch: (current?.epoch ?? 0) + 1,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    this.persistSessions();
+    await this.closeTransport();
   }
 
   status() {
@@ -244,6 +321,7 @@ export class BridgeDaemon {
       epoch: 1,
       updatedAt: new Date().toISOString(),
     });
+    this.persistSessions();
     return session;
   }
 
@@ -262,7 +340,104 @@ export class BridgeDaemon {
         this.attachedSessions.delete(attachedSessionId);
       }
     }
+    this.persistSessions();
     return existed;
+  }
+
+  private loadPersistedSessions(): void {
+    const statePath = this.options.statePath;
+    if (!statePath || !existsSync(statePath)) return;
+    let persisted: PersistedBridgeState;
+    try {
+      persisted = JSON.parse(readFileSync(statePath, "utf8")) as PersistedBridgeState;
+    } catch {
+      return;
+    }
+    if (persisted.schemaVersion !== 1 || !Array.isArray(persisted.sessions)) return;
+    const now = Date.now();
+    for (const entry of persisted.sessions) {
+      const session = entry?.session;
+      const control = entry?.control;
+      if (
+        entry?.schemaVersion !== 1 ||
+        !session ||
+        typeof session.sessionId !== "string" ||
+        typeof session.token !== "string" ||
+        !session.token ||
+        typeof session.ownerSessionId !== "string" ||
+        !/^nex-[a-f0-9]{16}$/.test(session.ownerSessionId) ||
+        !control ||
+        control.phase === "stopped" ||
+        typeof control.epoch !== "number" ||
+        !Number.isInteger(control.epoch) ||
+        !Array.isArray(entry.targetIds)
+      ) {
+        continue;
+      }
+      const savedAt = Date.parse(entry.savedAt || session.createdAt);
+      if (
+        !Number.isFinite(savedAt) ||
+        now - savedAt > (this.options.sessionRetentionMs ?? DEFAULT_SESSION_RETENTION_MS)
+      ) {
+        continue;
+      }
+      const detachedControl: ControlState = {
+        phase: "detached",
+        epoch: Math.max(1, control.epoch + 1),
+        updatedAt: new Date().toISOString(),
+      };
+      this.bridgeSessions.set(session.sessionId, session);
+      this.controlStates.set(session.sessionId, detachedControl);
+      this.sessionTargetScopes.set(session.sessionId, {
+        targetIds: new Set(entry.targetIds.filter((targetId) => typeof targetId === "string")),
+        attachedTargetIds: new Set(),
+      });
+      if (
+        entry.detachedAttachment &&
+        typeof entry.detachedAttachment.sessionId === "string" &&
+        typeof entry.detachedAttachment.profileId === "string" &&
+        typeof entry.detachedAttachment.tabId === "number"
+      ) {
+        this.detachedAttachments.set(session.sessionId, entry.detachedAttachment);
+      }
+    }
+    this.persistSessions();
+  }
+
+  private persistSessions(): void {
+    const statePath = this.options.statePath;
+    if (!statePath) return;
+    const sessions: PersistedBridgeSession[] = [];
+    for (const session of this.bridgeSessions.values()) {
+      if (!session.ownerSessionId || !/^nex-[a-f0-9]{16}$/.test(session.ownerSessionId)) continue;
+      const control = this.controlStates.get(session.sessionId);
+      if (!control || control.phase === "stopped") continue;
+      sessions.push({
+        schemaVersion: 1,
+        session: { ...session },
+        control: { ...control },
+        targetIds: [...(this.sessionTargetScopes.get(session.sessionId)?.targetIds ?? [])],
+        ...(this.detachedAttachments.has(session.sessionId)
+          ? { detachedAttachment: this.detachedAttachments.get(session.sessionId) }
+          : {}),
+        savedAt: new Date().toISOString(),
+      });
+    }
+    if (sessions.length === 0) {
+      rmSync(statePath, { force: true });
+      return;
+    }
+    mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 });
+    const staged = `${statePath}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(staged, `${JSON.stringify({ schemaVersion: 1, sessions })}\n`, {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      renameSync(staged, statePath);
+    } finally {
+      rmSync(staged, { force: true });
+    }
   }
 
   private async handleHttp(req: IncomingMessage, res: ServerResponse) {
@@ -330,6 +505,19 @@ export class BridgeDaemon {
           error: error instanceof Error ? error.message : String(error),
         });
       }
+      return;
+    }
+    const targetsMatch = /^\/control\/sessions\/([^/]+)\/targets$/.exec(url.pathname);
+    if (req.method === "GET" && targetsMatch) {
+      const ownerSessionId = decodeURIComponent(targetsMatch[1]);
+      if (!/^nex-[a-f0-9]{16}$/.test(ownerSessionId)) {
+        this.writeJson(res, 400, { error: "owner session id is invalid" });
+        return;
+      }
+      this.writeJson(res, 200, {
+        targets: this.reconnectTargets(ownerSessionId),
+        generatedAt: new Date().toISOString(),
+      });
       return;
     }
     const detachMatch = /^\/sessions\/([^/]+)\/detach$/.exec(url.pathname);
@@ -815,6 +1003,7 @@ export class BridgeDaemon {
       tabId,
       pendingActionRisk,
     });
+    this.persistSessions();
   }
 
   /**
@@ -850,6 +1039,32 @@ export class BridgeDaemon {
   private bridgeSessionsHasOwner(ownerSessionId: string): boolean {
     return [...this.bridgeSessions.values()].some(
       (session) => session.ownerSessionId === ownerSessionId,
+    );
+  }
+
+  private reconnectTargets(ownerSessionId: string): BridgeReconnectTarget[] {
+    return [...this.profiles.values()].flatMap((peer) =>
+      [...peer.tabs.values()]
+        .filter(shouldExposeTab)
+        .map((tab) => {
+          const targetId = targetIdFor(peer.profileId, tab.tabId);
+          const attached = [...this.attachedSessions.values()].find(
+            (entry) => entry.profileId === peer.profileId && entry.tabId === tab.tabId,
+          );
+          const owner = attached
+            ? this.bridgeSessions.get(attached.bridgeSessionId)?.ownerSessionId
+            : undefined;
+          const identity = redactedTabIdentity(tab.url);
+          return {
+            targetId,
+            profileId: peer.profileId,
+            active: tab.active === true,
+            available: !attached || owner === ownerSessionId,
+            controlled: Boolean(attached),
+            controlledByOwner: owner === ownerSessionId,
+            ...identity,
+          } satisfies BridgeReconnectTarget;
+        }),
     );
   }
 
@@ -905,6 +1120,7 @@ export class BridgeDaemon {
       session,
       this.attachedSessions.get(attachedSessionId) as AttachedSession,
     );
+    this.persistSessions();
     return {
       matched: sessions.length,
       attached: true,
@@ -975,6 +1191,7 @@ export class BridgeDaemon {
     );
     if (phase === "detached") {
       for (const entry of attached) this.attachedSessions.delete(entry.sessionId);
+      this.persistSessions();
       return;
     }
     if (phase === "human") {
@@ -1014,6 +1231,7 @@ export class BridgeDaemon {
         this.attachedSessions.delete(entry.sessionId);
       }
     }
+    this.persistSessions();
   }
 
   private cancelPendingForSession(bridgeSessionId: string, phase: ControlPhase): void {
@@ -1362,6 +1580,19 @@ function tabMatchesProfileUrlHint(tab: BridgeTab, hint: string): boolean {
     return pathname.endsWith(hint);
   } catch {
     return false;
+  }
+}
+
+function redactedTabIdentity(url: string): Pick<BridgeReconnectTarget, "host" | "path"> {
+  try {
+    const parsed = new URL(url);
+    const pathname = parsed.pathname || "/";
+    return {
+      host: parsed.host || null,
+      path: pathname.length > 160 ? `${pathname.slice(0, 157)}...` : pathname,
+    };
+  } catch {
+    return { host: null, path: null };
   }
 }
 

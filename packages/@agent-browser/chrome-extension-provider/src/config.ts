@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
 export const DEFAULT_BRIDGE_PORT = 19826;
 
@@ -9,16 +10,21 @@ export type BridgeConfig = {
   daemonCommand?: string;
   extensionId?: string;
   logPath?: string;
+  statePath?: string;
 };
 
 export function readBridgeConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
+  const logPath = nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_LOG);
   return {
     port: parsePort(env.AGENT_BROWSER_CHROME_BRIDGE_PORT),
     profileId: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE),
     profileUrlHint: parseProfileUrlHint(env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT),
     daemonCommand: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_DAEMON),
     extensionId: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID),
-    logPath: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_LOG),
+    logPath,
+    statePath:
+      nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_STATE) ||
+      join(logPath ? dirname(logPath) : process.cwd(), "sessions.json"),
   };
 }
 
