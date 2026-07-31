@@ -379,6 +379,213 @@ test("page takeover fences queued and future CDP commands and emits a bounded ow
   }
 });
 
+test("external tab detachment is recoverable and does not become user Stop", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
+  ]);
+
+  try {
+    const session = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+    });
+    const cdp = await connectCdp(port, session.sessionId, session.token);
+    const attached = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:101", flatten: true },
+    });
+
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "detach",
+        profileId: "profile-a",
+        tabId: 101,
+        sessionId: attached.result.sessionId,
+        reason: "tab_closed",
+      }),
+    );
+    await waitFor(async () => {
+      const events = await fetchJson(port, "/control/events?after=0");
+      return events.events.length === 1;
+    });
+
+    const events = await fetchJson(port, "/control/events?after=0");
+    assert.deepEqual(events.events[0], {
+      sequence: 1,
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+      bridgeSessionId: session.sessionId,
+      action: "detach",
+      reason: "tab_closed",
+      tabId: 101,
+      pendingActionRisk: false,
+      createdAt: events.events[0].createdAt,
+    });
+    const health = await fetchJson(port, "/health");
+    assert.equal(health.sessions[0].control.phase, "detached");
+
+    const reenabled = await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", {
+      phase: "agent",
+    });
+    assert.equal(reenabled.matched, 1);
+    const afterReenable = await fetchJson(port, "/health");
+    assert.equal(afterReenable.sessions[0].control.phase, "agent");
+    cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
+test("reconnect selects the Nex session tab and preserves the CDP attachment id", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
+  ]);
+
+  try {
+    const session = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+      profileUrlHint: "/session/session-a",
+    });
+    const cdp = await connectCdp(port, session.sessionId, session.token);
+    const attached = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.createTarget",
+      params: { url: "https://example.com/task" },
+    });
+    const attachment = await cdpCommand(cdp, {
+      id: 2,
+      method: "Target.attachToTarget",
+      params: { targetId: attached.result.targetId, flatten: true },
+    });
+    const oldAttachmentId = attachment.result.sessionId;
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "detach",
+        profileId: "profile-a",
+        tabId: 303,
+        sessionId: oldAttachmentId,
+        reason: "tab_closed",
+      }),
+    );
+    await waitFor(async () => (await fetchJson(port, "/control/events?after=0")).events.length === 1);
+
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "heartbeat",
+        profileId: "profile-a",
+        tabs: [
+          {
+            tabId: 202,
+            windowId: 1,
+            url: "http://127.0.0.1:3458/workspace/it/session/session-a",
+            title: "Nexolyra",
+            active: true,
+          },
+        ],
+      }),
+    );
+    const reconnected = await postJson(
+      port,
+      "/control/sessions/nex-aaaaaaaaaaaaaaaa/reconnect",
+      {},
+    );
+    assert.equal(reconnected.attached, true);
+    assert.equal(reconnected.targetId, "tab:profile-a:202");
+    assert.equal(reconnected.sessionId, oldAttachmentId);
+    assert.ok(
+      extension.commands.some(
+        (command) =>
+          command.method === "Bridge.setControlOverlay" &&
+          command.tabId === 202 &&
+          command.sessionId === oldAttachmentId,
+      ),
+    );
+
+    const targets = await cdpCommand(cdp, { id: 2, method: "Target.getTargets", params: {} });
+    assert.deepEqual(
+      targets.result.targetInfos.map((target) => target.targetId),
+      ["tab:profile-a:202"],
+    );
+    cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
+test("reconnect accepts an explicit target from another connected Chrome profile", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const first = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://a.example", title: "A", active: true },
+  ]);
+  const second = await connectExtension(port, "profile-b", [
+    { tabId: 201, windowId: 2, url: "https://b.example", title: "B", active: true },
+  ]);
+
+  try {
+    const session = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+    });
+    const cdp = await connectCdp(port, session.sessionId, session.token);
+    const attached = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:101", flatten: true },
+    });
+    first.send(
+      JSON.stringify({
+        v: 1,
+        kind: "detach",
+        profileId: "profile-a",
+        tabId: 101,
+        sessionId: attached.result.sessionId,
+        reason: "browser_closed",
+      }),
+    );
+    await waitFor(async () => (await fetchJson(port, "/control/events?after=0")).events.length === 1);
+    second.send(
+      JSON.stringify({
+        v: 1,
+        kind: "heartbeat",
+        profileId: "profile-b",
+        tabs: [
+          { tabId: 303, windowId: 2, url: "https://b.example/replacement", title: "B2", active: true },
+        ],
+      }),
+    );
+
+    const reconnected = await postJson(
+      port,
+      "/control/sessions/nex-aaaaaaaaaaaaaaaa/reconnect",
+      { targetId: "tab:profile-b:303" },
+    );
+    assert.equal(reconnected.attached, true);
+    assert.equal(reconnected.targetId, "tab:profile-b:303");
+    assert.equal(reconnected.sessionId, attached.result.sessionId);
+    assert.ok(
+      second.commands.some(
+        (command) => command.method === "Bridge.setControlOverlay" && command.tabId === 303,
+      ),
+    );
+    cdp.close();
+  } finally {
+    first.close();
+    second.close();
+    await daemon.stop();
+  }
+});
+
 test("daemon routes CDP events only to the owning bridge session", async () => {
   const port = await freePort();
   const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });

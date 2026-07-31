@@ -89,6 +89,13 @@ export type BridgeEvent = {
 
 export type BridgeControlAction = "takeover" | "stop";
 
+export type BridgeDetachReason =
+  | "tab_closed"
+  | "debugger_detached"
+  | "extension_disconnected"
+  | "browser_closed"
+  | "unknown";
+
 /** User intent emitted by the in-page operator boundary. */
 export type BridgeControlEvent = {
   v: typeof BRIDGE_PROTOCOL_VERSION;
@@ -102,8 +109,10 @@ export type BridgeControlEvent = {
 export type BridgeDetach = {
   v: typeof BRIDGE_PROTOCOL_VERSION;
   kind: "detach";
-  profileId?: string;
-  sessionId?: string;
+  profileId: string;
+  tabId: number;
+  sessionId: string;
+  reason: BridgeDetachReason;
 };
 
 export type BridgeError = {

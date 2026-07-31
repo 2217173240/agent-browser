@@ -47,7 +47,7 @@ export default defineBackground(() => {
   chrome.tabs.onRemoved.addListener((tabId) => {
     const overlay = controlOverlays.get(tabId);
     if (overlay && overlay.phase !== "stopped") {
-      void emitControlEvent(tabId, overlay.sessionId, "stop");
+      void emitDetach(tabId, overlay.sessionId, "tab_closed");
     }
     attachedTabs.delete(tabId);
     controlOverlays.delete(tabId);
@@ -78,7 +78,7 @@ export default defineBackground(() => {
     if (source.tabId) {
       const overlay = controlOverlays.get(source.tabId);
       if (overlay && overlay.phase !== "stopped") {
-        void emitControlEvent(source.tabId, overlay.sessionId, "stop");
+        void emitDetach(source.tabId, overlay.sessionId, "debugger_detached");
       }
       attachedTabs.delete(source.tabId);
       controlOverlays.delete(source.tabId);
@@ -309,6 +309,21 @@ async function emitControlEvent(
     tabId,
     sessionId,
     action,
+  });
+}
+
+async function emitDetach(
+  tabId: number,
+  sessionId: string,
+  reason: "tab_closed" | "debugger_detached" | "extension_disconnected" | "browser_closed" | "unknown",
+): Promise<void> {
+  await sendBridgeMessage({
+    v: BRIDGE_PROTOCOL_VERSION,
+    kind: "detach",
+    profileId: "",
+    tabId,
+    sessionId,
+    reason,
   });
 }
 

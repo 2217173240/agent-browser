@@ -8,6 +8,7 @@ import {
   type BridgeCommand,
   type BridgeControlAction,
   type BridgeControlEvent,
+  type BridgeDetachReason,
   type BridgeMessage,
   type BridgeResult,
   type BridgeSession,
@@ -51,12 +52,19 @@ type AttachedSession = {
 
 type SessionTargetScope = {
   targetIds: Set<string>;
+  attachedTargetIds: Set<string>;
 };
 
 type DetachedTargetScope = {
   profileUrlHint: string;
   scope: SessionTargetScope;
   cleanupTimer: ReturnType<typeof setTimeout>;
+};
+
+type DetachedAttachment = {
+  sessionId: string;
+  profileId: string;
+  tabId: number;
 };
 
 type PendingCommand = {
@@ -67,7 +75,7 @@ type PendingCommand = {
   bridgeSessionId?: string;
 };
 
-type ControlPhase = "agent" | "human" | "stopped";
+type ControlPhase = "agent" | "human" | "detached" | "stopped";
 
 type ControlState = {
   phase: ControlPhase;
@@ -79,7 +87,8 @@ type QueuedControlEvent = {
   sequence: number;
   ownerSessionId: string;
   bridgeSessionId: string;
-  action: BridgeControlAction;
+  action: BridgeControlAction | "detach";
+  reason?: BridgeDetachReason;
   tabId: number;
   pendingActionRisk: boolean;
   createdAt: string;
@@ -106,6 +115,7 @@ export class BridgeDaemon {
   private readonly bridgeSessions = new Map<string, BridgeSession>();
   private readonly sessionTargetScopes = new Map<string, SessionTargetScope>();
   private readonly detachedTargetScopes = new Map<string, DetachedTargetScope>();
+  private readonly detachedAttachments = new Map<string, DetachedAttachment>();
   private readonly attachedSessions = new Map<string, AttachedSession>();
   private readonly controlStates = new Map<string, ControlState>();
   private readonly controlEvents: QueuedControlEvent[] = [];
@@ -220,9 +230,13 @@ export class BridgeDaemon {
       if (detached?.profileUrlHint === profileUrlHint) {
         clearTimeout(detached.cleanupTimer);
         this.detachedTargetScopes.delete(ownerSessionId!);
+        detached.scope.attachedTargetIds ??= new Set();
         this.sessionTargetScopes.set(session.sessionId, detached.scope);
       } else {
-        this.sessionTargetScopes.set(session.sessionId, { targetIds: new Set() });
+        this.sessionTargetScopes.set(session.sessionId, {
+          targetIds: new Set(),
+          attachedTargetIds: new Set(),
+        });
       }
     }
     this.controlStates.set(session.sessionId, {
@@ -237,10 +251,12 @@ export class BridgeDaemon {
     const session = this.bridgeSessions.get(sessionId);
     if (session) {
       await this.setBridgeControl(session, "stopped");
+      this.sessionTargetScopes.get(sessionId)?.attachedTargetIds.clear();
       await this.releaseOwnedTargets(session);
     }
     const existed = this.bridgeSessions.delete(sessionId);
     this.controlStates.delete(sessionId);
+    this.detachedAttachments.delete(sessionId);
     for (const [attachedSessionId, attached] of this.attachedSessions) {
       if (attached.bridgeSessionId === sessionId) {
         this.attachedSessions.delete(attachedSessionId);
@@ -296,6 +312,26 @@ export class BridgeDaemon {
       });
       return;
     }
+    const reconnectMatch = /^\/control\/sessions\/([^/]+)\/reconnect$/.exec(url.pathname);
+    if (req.method === "POST" && reconnectMatch) {
+      const ownerSessionId = decodeURIComponent(reconnectMatch[1]);
+      const body = await readJsonBody(req);
+      const targetId = typeof body.targetId === "string" ? body.targetId : undefined;
+      try {
+        this.writeJson(
+          res,
+          200,
+          await this.reconnectOwnerSession(ownerSessionId, targetId),
+        );
+      } catch (error) {
+        this.writeJson(res, 409, {
+          matched: this.bridgeSessionsHasOwner(ownerSessionId) ? 1 : 0,
+          attached: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      return;
+    }
     const detachMatch = /^\/sessions\/([^/]+)\/detach$/.exec(url.pathname);
     if (req.method === "POST" && detachMatch) {
       this.writeJson(res, 200, { detached: await this.detachBridgeSession(detachMatch[1]) });
@@ -348,6 +384,15 @@ export class BridgeDaemon {
     ws.on("close", () => {
       for (const [profileId, peer] of this.profiles) {
         if (peer.ws === ws) {
+          for (const attached of [...this.attachedSessions.values()]) {
+            if (attached.profileId !== profileId) continue;
+            void this.handleDetachedTarget(
+              profileId,
+              attached.tabId,
+              attached.sessionId,
+              "extension_disconnected",
+            );
+          }
           this.profiles.delete(profileId);
         }
       }
@@ -414,6 +459,15 @@ export class BridgeDaemon {
     }
     if (message.kind === "control-event") {
       await this.handleControlEvent(message);
+      return;
+    }
+    if (message.kind === "detach") {
+      await this.handleDetachedTarget(
+        message.profileId,
+        message.tabId,
+        message.sessionId,
+        message.reason,
+      );
     }
   }
 
@@ -676,6 +730,9 @@ export class BridgeDaemon {
     ) {
       throw new Error("Browser control is stopped");
     }
+    if (state?.phase === "detached") {
+      throw new Error("Browser control is detached from Chrome");
+    }
   }
 
   private async showControlOverlay(
@@ -714,18 +771,164 @@ export class BridgeDaemon {
       (pending) => pending.bridgeSessionId === bridgeSession.sessionId,
     );
     await this.setBridgeControl(bridgeSession, message.action === "takeover" ? "human" : "stopped");
-    const event: QueuedControlEvent = {
-      sequence: ++this.controlEventSequence,
+    this.enqueueControlEvent({
       ownerSessionId: bridgeSession.ownerSessionId,
       bridgeSessionId: bridgeSession.sessionId,
       action: message.action,
       tabId: message.tabId,
       pendingActionRisk,
+    });
+  }
+
+  private async handleDetachedTarget(
+    profileId: string,
+    tabId: number,
+    sessionId: string,
+    reason: BridgeDetachReason,
+  ): Promise<void> {
+    const attached = this.attachedSessions.get(sessionId);
+    if (!attached || attached.profileId !== profileId || attached.tabId !== tabId) return;
+    const bridgeSession = this.bridgeSessions.get(attached.bridgeSessionId);
+    if (!bridgeSession?.ownerSessionId) return;
+    const current = this.controlStates.get(bridgeSession.sessionId);
+    if (current?.phase === "stopped") return;
+    const pendingActionRisk = [...this.pending.values()].some(
+      (pending) => pending.bridgeSessionId === bridgeSession.sessionId,
+    );
+    this.detachedAttachments.set(bridgeSession.sessionId, {
+      sessionId: attached.sessionId,
+      profileId: attached.profileId,
+      tabId: attached.tabId,
+    });
+    this.sessionTargetScopes.get(bridgeSession.sessionId)?.attachedTargetIds.delete(
+      targetIdFor(attached.profileId, attached.tabId),
+    );
+    await this.setBridgeControl(bridgeSession, "detached");
+    this.attachedSessions.delete(attached.sessionId);
+    this.enqueueControlEvent({
+      ownerSessionId: bridgeSession.ownerSessionId,
+      bridgeSessionId: bridgeSession.sessionId,
+      action: "detach",
+      reason,
+      tabId,
+      pendingActionRisk,
+    });
+  }
+
+  private enqueueControlEvent(event: Omit<QueuedControlEvent, "sequence" | "createdAt">): void {
+    this.controlEvents.push({
+      ...event,
+      sequence: ++this.controlEventSequence,
       createdAt: new Date().toISOString(),
-    };
-    this.controlEvents.push(event);
+    });
     if (this.controlEvents.length > 256)
       this.controlEvents.splice(0, this.controlEvents.length - 256);
+  }
+
+  private bridgeSessionsHasOwner(ownerSessionId: string): boolean {
+    return [...this.bridgeSessions.values()].some(
+      (session) => session.ownerSessionId === ownerSessionId,
+    );
+  }
+
+  private async reconnectOwnerSession(
+    ownerSessionId: string,
+    requestedTargetId?: string,
+  ): Promise<{
+    matched: number;
+    attached: boolean;
+    targetId?: string;
+    sessionId?: string;
+    profileId?: string;
+  }> {
+    const sessions = [...this.bridgeSessions.values()].filter(
+      (session) => session.ownerSessionId === ownerSessionId,
+    );
+    if (sessions.length === 0) return { matched: 0, attached: false };
+    const session =
+      sessions.find((candidate) => this.controlStates.get(candidate.sessionId)?.phase === "detached") ??
+      sessions.at(-1)!;
+    const control = this.controlStates.get(session.sessionId);
+    if (control?.phase === "stopped") throw new Error("Browser control is stopped");
+    const existing = [...this.attachedSessions.values()].find(
+      (attached) => attached.bridgeSessionId === session.sessionId,
+    );
+    if (existing) {
+      return {
+        matched: sessions.length,
+        attached: true,
+        targetId: targetIdFor(existing.profileId, existing.tabId),
+        sessionId: existing.sessionId,
+        profileId: existing.profileId,
+      };
+    }
+    const target = this.resolveReconnectTarget(session, requestedTargetId);
+    if (this.hasAttachedSession(target.peer.profileId, target.tab.tabId)) {
+      throw new Error("The requested Chrome tab is already controlled by another session");
+    }
+    await this.setBridgeControl(session, "agent");
+    const previous = this.detachedAttachments.get(session.sessionId);
+    const attachedSessionId =
+      previous?.sessionId ?? sessionIdFor(target.tab.tabId, this.attachSequence++);
+    this.attachedSessions.set(attachedSessionId, {
+      sessionId: attachedSessionId,
+      bridgeSessionId: session.sessionId,
+      profileId: target.peer.profileId,
+      tabId: target.tab.tabId,
+    });
+    this.sessionTargetScopes.get(session.sessionId)?.attachedTargetIds.add(target.targetId);
+    this.detachedAttachments.delete(session.sessionId);
+    session.profileId = target.peer.profileId;
+    await this.showControlOverlay(
+      session,
+      this.attachedSessions.get(attachedSessionId) as AttachedSession,
+    );
+    return {
+      matched: sessions.length,
+      attached: true,
+      targetId: target.targetId,
+      sessionId: attachedSessionId,
+      profileId: target.peer.profileId,
+    };
+  }
+
+  private resolveReconnectTarget(
+    session: BridgeSession,
+    requestedTargetId?: string,
+  ): { targetId: string; peer: ProfilePeer; tab: BridgeTab } {
+    if (requestedTargetId) {
+      const ref = parseTargetId(requestedTargetId);
+      if (!ref) throw new Error("Reconnect targetId is invalid");
+      const peer = this.profiles.get(ref.profileId);
+      const tab = peer?.tabs.get(ref.tabId);
+      if (!peer || !tab || !shouldExposeTab(tab)) {
+        throw new Error("Reconnect target is not available");
+      }
+      return { targetId: requestedTargetId, peer, tab };
+    }
+    const peers = session.profileId
+      ? [this.profiles.get(session.profileId)].filter((peer): peer is ProfilePeer => Boolean(peer))
+      : [...this.profiles.values()];
+    const candidates = peers.flatMap((peer) =>
+      [...peer.tabs.values()]
+        .filter(
+          (tab) =>
+            shouldExposeTab(tab) &&
+            (!session.profileUrlHint || tabMatchesProfileUrlHint(tab, session.profileUrlHint)),
+        )
+        .map((tab) => ({ peer, tab, targetId: targetIdFor(peer.profileId, tab.tabId) })),
+    );
+    if (candidates.length === 1) return candidates[0];
+    const active = candidates.filter(({ tab }) => tab.active);
+    if (active.length === 1) return active[0];
+    if (candidates.length === 0) {
+      throw new Error(
+        session.profileUrlHint
+          ? "The Nexolyra session tab is not available; provide an explicit reconnect target"
+          : "No reconnectable Chrome tab is available",
+      );
+    }
+    throw new Error("Reconnect requires an explicit targetId because multiple Chrome tabs match");
   }
 
   private async setOwnerControl(ownerSessionId: string, phase: ControlPhase): Promise<number> {
@@ -748,6 +951,10 @@ export class BridgeDaemon {
     const attached = [...this.attachedSessions.values()].filter(
       (entry) => entry.bridgeSessionId === session.sessionId,
     );
+    if (phase === "detached") {
+      for (const entry of attached) this.attachedSessions.delete(entry.sessionId);
+      return;
+    }
     if (phase === "human") {
       const focused =
         attached.find(
@@ -796,9 +1003,11 @@ export class BridgeDaemon {
         pending.cdpClient,
         pending.cdpId,
         cdpError(
-          phase === "human"
-            ? "Browser control was taken over by the user"
-            : "Browser control was stopped",
+            phase === "human"
+              ? "Browser control was taken over by the user"
+              : phase === "detached"
+                ? "Browser control was detached from Chrome"
+                : "Browser control was stopped",
         ),
       );
     }
@@ -864,7 +1073,7 @@ export class BridgeDaemon {
   private tabsForSession(session: BridgeSession, peer: ProfilePeer): BridgeTab[] {
     const scope = this.sessionTargetScopes.get(session.sessionId);
     if (!scope) return [...peer.tabs.values()];
-    return [...scope.targetIds]
+    return [...new Set([...scope.targetIds, ...scope.attachedTargetIds])]
       .map((targetId) => parseTargetId(targetId))
       .filter((ref) => ref?.profileId === peer.profileId)
       .map((ref) => peer.tabs.get(ref!.tabId))
@@ -873,7 +1082,11 @@ export class BridgeDaemon {
 
   private assertTargetAllowed(session: BridgeSession, targetId: string | undefined): void {
     const scope = this.sessionTargetScopes.get(session.sessionId);
-    if (!scope || (targetId && scope.targetIds.has(targetId))) return;
+    if (
+      !scope ||
+      (targetId && (scope.targetIds.has(targetId) || scope.attachedTargetIds.has(targetId)))
+    )
+      return;
     throw new Error("Target is outside this Chrome bridge session");
   }
 
@@ -941,6 +1154,10 @@ export class BridgeDaemon {
   private deleteAttachedSessionsForTab(profileId: string, tabId: number): void {
     for (const [sessionId, attached] of this.attachedSessions) {
       if (attached.profileId === profileId && attached.tabId === tabId) {
+        this.sessionTargetScopes.get(attached.bridgeSessionId)?.attachedTargetIds.delete(
+          targetIdFor(profileId, tabId),
+        );
+        this.detachedAttachments.delete(attached.bridgeSessionId);
         this.attachedSessions.delete(sessionId);
       }
     }
