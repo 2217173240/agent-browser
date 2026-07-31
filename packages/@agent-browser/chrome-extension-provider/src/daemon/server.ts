@@ -432,6 +432,7 @@ export class BridgeDaemon {
         ws,
         tabs: tabsToMap(message.tabs ?? []),
       });
+      await this.reconcileProfileTabs(message.profileId);
       await this.resyncProfileOverlays(message.profileId);
       this.logger.debug("extension profile connected", { profileId: message.profileId });
       return;
@@ -440,6 +441,7 @@ export class BridgeDaemon {
       const peer = this.profiles.get(message.profileId);
       if (peer && message.tabs) {
         peer.tabs = tabsToMap(message.tabs);
+        await this.reconcileProfileTabs(message.profileId);
       }
       return;
     }
@@ -813,6 +815,26 @@ export class BridgeDaemon {
       tabId,
       pendingActionRisk,
     });
+  }
+
+  /**
+   * A Chrome restart can kill the extension worker before it has a chance to
+   * emit `detach`. Reconcile the daemon's attachment table against each full
+   * hello/heartbeat tab snapshot so those sessions enter the same recoverable
+   * detached state instead of staying falsely attached forever.
+   */
+  private async reconcileProfileTabs(profileId: string): Promise<void> {
+    const peer = this.profiles.get(profileId);
+    if (!peer) return;
+    for (const attached of [...this.attachedSessions.values()]) {
+      if (attached.profileId !== profileId || peer.tabs.has(attached.tabId)) continue;
+      await this.handleDetachedTarget(
+        profileId,
+        attached.tabId,
+        attached.sessionId,
+        "browser_closed",
+      );
+    }
   }
 
   private enqueueControlEvent(event: Omit<QueuedControlEvent, "sequence" | "createdAt">): void {

@@ -586,6 +586,71 @@ test("reconnect accepts an explicit target from another connected Chrome profile
   }
 });
 
+test("a full tab snapshot turns a silently closed browser into a recoverable detach", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
+  ]);
+
+  try {
+    const session = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+    });
+    const cdp = await connectCdp(port, session.sessionId, session.token);
+    const attached = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:101", flatten: true },
+    });
+
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "heartbeat",
+        profileId: "profile-a",
+        tabs: [],
+      }),
+    );
+    await waitFor(async () => (await fetchJson(port, "/control/events?after=0")).events.length === 1);
+
+    const events = await fetchJson(port, "/control/events?after=0");
+    assert.equal(events.events[0].action, "detach");
+    assert.equal(events.events[0].reason, "browser_closed");
+    assert.equal((await fetchJson(port, "/health")).sessions[0].control.phase, "detached");
+
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "heartbeat",
+        profileId: "profile-a",
+        tabs: [
+          {
+            tabId: 202,
+            windowId: 1,
+            url: "http://127.0.0.1:3458/workspace/it/session/restarted",
+            title: "Nexolyra",
+            active: true,
+          },
+        ],
+      }),
+    );
+    const reconnected = await postJson(
+      port,
+      "/control/sessions/nex-aaaaaaaaaaaaaaaa/reconnect",
+      {},
+    );
+    assert.equal(reconnected.attached, true);
+    assert.equal(reconnected.targetId, "tab:profile-a:202");
+    assert.equal(reconnected.sessionId, attached.result.sessionId);
+    cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
 test("daemon routes CDP events only to the owning bridge session", async () => {
   const port = await freePort();
   const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
