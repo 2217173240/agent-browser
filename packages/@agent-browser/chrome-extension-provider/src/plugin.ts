@@ -65,7 +65,12 @@ async function launchBrowserProvider(): Promise<PluginResponse> {
       `no Chrome extension profile connected on port ${config.port}; load the unpacked extension at ${extensionPath()} and retry`,
     );
   }
-  const session = await createSession(config.port, config.profileId, config.profileUrlHint);
+  const session = await createSession(
+    config.port,
+    config.profileId,
+    config.profileUrlHint,
+    config.returnOrigin,
+  );
   return {
     protocol: PLUGIN_PROTOCOL,
     success: true,
@@ -155,11 +160,12 @@ async function createSession(
   port: number,
   profileId: string | undefined,
   profileUrlHint: string | undefined,
+  returnOrigin: string | undefined,
 ): Promise<BridgeSession> {
   const ownerSessionId = process.env.NEXOLYRA_AGENT_BROWSER_SESSION_ID;
   return (await fetchJson(`http://127.0.0.1:${port}/sessions`, {
     method: "POST",
-    body: JSON.stringify({ profileId, profileUrlHint, ownerSessionId }),
+    body: JSON.stringify({ profileId, profileUrlHint, returnOrigin, ownerSessionId }),
     headers: { "content-type": "application/json" },
   })) as BridgeSession;
 }

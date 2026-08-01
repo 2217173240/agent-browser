@@ -44,6 +44,7 @@ export type BridgeHello = {
   kind: "hello";
   profileId: string;
   extensionId: string;
+  extensionVersion?: string;
   chromeVersion?: string;
   tabs?: BridgeTab[];
 };
@@ -148,6 +149,7 @@ export type BridgeSession = {
   token: string;
   profileId?: string;
   profileUrlHint?: string;
+  returnOrigin?: string;
   ownerSessionId?: string;
   createdAt: string;
 };

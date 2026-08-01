@@ -8,6 +8,7 @@ const daemon = new BridgeDaemon({
   allowedExtensionId: config.extensionId,
   logPath: config.logPath,
   statePath: config.statePath,
+  supervisedByNexolyra: config.supervisedByNexolyra,
 });
 
 const shutdown = async () => {

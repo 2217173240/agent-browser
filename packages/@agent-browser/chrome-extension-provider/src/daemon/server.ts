@@ -44,11 +44,13 @@ export type BridgeDaemonOptions = {
   detachedTargetGraceMs?: number;
   statePath?: string;
   sessionRetentionMs?: number;
+  supervisedByNexolyra?: boolean;
 };
 
 type ProfilePeer = {
   profileId: string;
   extensionId: string;
+  extensionVersion?: string;
   chromeVersion?: string;
   ws: WebSocket;
   tabs: Map<number, BridgeTab>;
@@ -115,6 +117,7 @@ type QueuedControlEvent = {
   action: BridgeControlAction | "detach";
   reason?: BridgeDetachReason;
   tabId: number;
+  targetId?: string;
   pendingActionRisk: boolean;
   createdAt: string;
 };
@@ -271,9 +274,11 @@ export class BridgeDaemon {
       version: CHROME_EXTENSION_PROVIDER_VERSION,
       bridgeProtocolVersion: BRIDGE_PROTOCOL_VERSION,
       port: this.options.port,
+      supervisedByNexolyra: this.options.supervisedByNexolyra === true,
       profiles: [...this.profiles.values()].map((peer) => ({
         profileId: peer.profileId,
         extensionId: peer.extensionId,
+        extensionVersion: peer.extensionVersion ?? null,
         chromeVersion: peer.chromeVersion ?? null,
         tabCount: peer.tabs.size,
         tabs: [...peer.tabs.values()],
@@ -293,12 +298,14 @@ export class BridgeDaemon {
     profileId?: string,
     ownerSessionId?: string,
     profileUrlHint?: string,
+    returnOrigin?: string,
   ): BridgeSession {
     const session: BridgeSession = {
       sessionId: randomUUID(),
       token: randomBytes(24).toString("base64url"),
       profileId,
       profileUrlHint,
+      returnOrigin,
       ownerSessionId,
       createdAt: new Date().toISOString(),
     };
@@ -411,6 +418,14 @@ export class BridgeDaemon {
         action: "detach",
         reason: "extension_disconnected",
         tabId: entry.detachedAttachment?.tabId ?? 0,
+        ...(entry.detachedAttachment
+          ? {
+              targetId: targetIdFor(
+                entry.detachedAttachment.profileId,
+                entry.detachedAttachment.tabId,
+              ),
+            }
+          : {}),
         pendingActionRisk: true,
       });
     }
@@ -470,11 +485,23 @@ export class BridgeDaemon {
         });
         return;
       }
+      const returnOrigin = validReturnOrigin(body.returnOrigin);
+      if (body.returnOrigin !== undefined && !returnOrigin) {
+        this.writeJson(res, 400, {
+          error: "returnOrigin must be an HTTP(S) loopback origin",
+        });
+        return;
+      }
       const ownerSessionId =
         typeof body.ownerSessionId === "string" && /^nex-[a-f0-9]{16}$/.test(body.ownerSessionId)
           ? body.ownerSessionId
           : undefined;
-      const session = this.createBridgeSession(profileId, ownerSessionId, profileUrlHint);
+      const session = this.createBridgeSession(
+        profileId,
+        ownerSessionId,
+        profileUrlHint,
+        returnOrigin,
+      );
       this.writeJson(res, 200, session);
       return;
     }
@@ -496,11 +523,19 @@ export class BridgeDaemon {
         this.writeJson(res, 400, { error: "phase must be agent, human, or stopped" });
         return;
       }
-      const result = await this.setOwnerControl(ownerSessionId, phase);
-      this.writeJson(res, 200, {
-        matched: result.matched,
-        focusConfirmed: result.focusConfirmed,
-      });
+      try {
+        const result = await this.setOwnerControl(ownerSessionId, phase);
+        this.writeJson(res, 200, {
+          matched: result.matched,
+          focusConfirmed: result.focusConfirmed,
+        });
+      } catch (error) {
+        this.writeJson(res, 409, {
+          matched: this.bridgeSessionsHasOwner(ownerSessionId) ? 1 : 0,
+          focusConfirmed: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
       return;
     }
     const reconnectMatch = /^\/control\/sessions\/([^/]+)\/reconnect$/.exec(url.pathname);
@@ -632,6 +667,7 @@ export class BridgeDaemon {
       this.profiles.set(message.profileId, {
         profileId: message.profileId,
         extensionId: message.extensionId,
+        extensionVersion: message.extensionVersion,
         chromeVersion: message.chromeVersion,
         ws,
         tabs: tabsToMap(message.tabs ?? []),
@@ -955,7 +991,12 @@ export class BridgeDaemon {
       tabId: attached.tabId,
       params: {
         phase,
-        ...(bridgeSession.profileUrlHint ? { returnPath: bridgeSession.profileUrlHint } : {}),
+        ...(phase === "human" && bridgeSession.profileUrlHint && bridgeSession.returnOrigin
+          ? {
+              returnPath: bridgeSession.profileUrlHint,
+              returnOrigin: bridgeSession.returnOrigin,
+            }
+          : {}),
       },
     });
   }
@@ -986,6 +1027,7 @@ export class BridgeDaemon {
       bridgeSessionId: bridgeSession.sessionId,
       action: message.action,
       tabId: message.tabId,
+      targetId: targetIdFor(attached.profileId, message.tabId),
       pendingActionRisk,
     });
   }
@@ -1021,6 +1063,7 @@ export class BridgeDaemon {
       action: "detach",
       reason,
       tabId,
+      targetId: targetIdFor(attached.profileId, tabId),
       pendingActionRisk,
     });
     this.persistSessions();
@@ -1252,7 +1295,10 @@ export class BridgeDaemon {
       // false negative merely because no CDP client is currently attached.
       if (!focused) {
         peer = this.trySelectProfile(session);
-        const scopedTabs = peer ? this.tabsForSession(session, peer).filter(shouldExposeTab) : [];
+        const scopedTabs =
+          peer && this.sessionTargetScopes.has(session.sessionId)
+            ? this.tabsForSession(session, peer).filter(shouldExposeTab)
+            : [];
         const fallback = scopedTabs.find((tab) => tab.active) ?? scopedTabs.at(-1);
         tabId = fallback?.tabId;
       }
@@ -1279,7 +1325,9 @@ export class BridgeDaemon {
         tabId: entry.tabId,
         params: {
           phase,
-          ...(session.profileUrlHint ? { returnPath: session.profileUrlHint } : {}),
+          ...(phase === "human" && session.profileUrlHint && session.returnOrigin
+            ? { returnPath: session.profileUrlHint, returnOrigin: session.returnOrigin }
+            : {}),
         },
       });
       if (phase === "stopped") {
@@ -1299,6 +1347,7 @@ export class BridgeDaemon {
     if ([...this.attachedSessions.values()].some((entry) => entry.bridgeSessionId === session.sessionId)) {
       return true;
     }
+    if (!this.sessionTargetScopes.has(session.sessionId)) return false;
     const peer = this.trySelectProfile(session);
     return Boolean(peer && this.tabsForSession(session, peer).some(shouldExposeTab));
   }
@@ -1641,6 +1690,31 @@ function validProfileUrlHint(value: unknown): string | undefined {
     return undefined;
   }
   return hint.length > 1 ? hint.replace(/\/+$/, "") : hint;
+}
+
+function validReturnOrigin(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > 256) return undefined;
+  try {
+    const parsed = new URL(value);
+    const loopback =
+      parsed.hostname === "127.0.0.1" ||
+      parsed.hostname === "localhost" ||
+      parsed.hostname === "[::1]";
+    if (
+      !loopback ||
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+      parsed.username ||
+      parsed.password ||
+      parsed.pathname !== "/" ||
+      parsed.search ||
+      parsed.hash
+    ) {
+      return undefined;
+    }
+    return parsed.origin;
+  } catch {
+    return undefined;
+  }
 }
 
 function tabMatchesProfileUrlHint(tab: BridgeTab, hint: string): boolean {

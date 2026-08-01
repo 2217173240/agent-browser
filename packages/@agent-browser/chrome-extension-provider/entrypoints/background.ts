@@ -22,6 +22,7 @@ const controlOverlays = new Map<
     sessionId: string;
     phase: "agent" | "human" | "stopped";
     returnPath?: string;
+    returnOrigin?: string;
   }
 >();
 let bridge: WebSocket | null = null;
@@ -258,13 +259,16 @@ async function executeCommand(command: BridgeCommand): Promise<unknown> {
       typeof command.params?.returnPath === "string" && command.params.returnPath.startsWith("/")
         ? command.params.returnPath.slice(0, 512)
         : undefined;
+    const returnOrigin = normalizeLoopbackOrigin(command.params?.returnOrigin);
     await ensureDebuggerAttached(tabId);
     const current = controlOverlays.get(tabId);
     const overlay = {
       nonce: current?.sessionId === sessionId ? current.nonce : crypto.randomUUID(),
       sessionId,
       phase,
-      ...(returnPath ? { returnPath } : {}),
+      ...(phase === "human" && returnPath && returnOrigin
+        ? { returnPath, returnOrigin }
+        : {}),
     };
     controlOverlays.set(tabId, overlay);
     await injectControlOverlay(tabId, overlay);
@@ -312,8 +316,8 @@ function handleControlBinding(tabId: number, params: unknown): boolean {
     if (payload.action !== "takeover" && payload.action !== "stop" && payload.action !== "return")
       return true;
     if (payload.action === "return") {
-      if (overlay.phase !== "human" || !overlay.returnPath) return true;
-      void activateNexolyraTab(overlay.returnPath).catch(() => undefined);
+      if (overlay.phase !== "human" || !overlay.returnPath || !overlay.returnOrigin) return true;
+      void activateNexolyraTab(overlay.returnOrigin, overlay.returnPath).catch(() => undefined);
       return true;
     }
     if (overlay.phase !== "agent" && payload.action === "takeover") return true;
@@ -361,6 +365,7 @@ async function injectControlOverlay(
     sessionId: string;
     phase: "agent" | "human" | "stopped";
     returnPath?: string;
+    returnOrigin?: string;
   },
 ): Promise<void> {
   await debuggerSendCommand({ tabId }, "Runtime.enable", {}).catch(() => undefined);
@@ -371,7 +376,7 @@ async function injectControlOverlay(
     binding: CONTROL_BINDING,
     nonce: overlay.nonce,
     phase: overlay.phase,
-    returnPath: overlay.returnPath,
+    showReturn: overlay.phase === "human" && Boolean(overlay.returnOrigin && overlay.returnPath),
   });
   const expression = `(() => {
     const config = ${config};
@@ -399,7 +404,7 @@ async function injectControlOverlay(
       return node;
     };
     if (config.phase === "agent") bar.append(button("Take over", "takeover", true));
-    if (config.phase === "human" && config.returnPath) {
+    if (config.phase === "human" && config.showReturn) {
       bar.append(button("Return to Nexolyra", "return", true));
     }
     if (config.phase !== "stopped") bar.append(button("Stop", "stop", false));
@@ -413,14 +418,20 @@ async function injectControlOverlay(
   });
 }
 
-async function activateNexolyraTab(returnPath: string): Promise<void> {
+async function activateNexolyraTab(returnOrigin: string, returnPath: string): Promise<void> {
+  const trustedOrigin = normalizeLoopbackOrigin(returnOrigin);
+  if (!trustedOrigin) throw new Error("Nexolyra return origin is not trusted");
   const normalized = returnPath.endsWith("/") ? returnPath : `${returnPath}/`;
   const tabs = await tabsQuery({});
   const target = tabs.find((tab) => {
     if (typeof tab.id !== "number" || typeof tab.windowId !== "number" || !tab.url) return false;
     try {
-      const pathname = new URL(tab.url).pathname;
-      return pathname === returnPath || pathname === normalized || pathname.endsWith(returnPath);
+      const parsed = new URL(tab.url);
+      const pathname = parsed.pathname;
+      return (
+        parsed.origin === trustedOrigin &&
+        (pathname === returnPath || pathname === normalized || pathname.endsWith(returnPath))
+      );
     } catch {
       return false;
     }
@@ -432,12 +443,38 @@ async function activateNexolyraTab(returnPath: string): Promise<void> {
   await windowsUpdate(target.windowId, { focused: true });
 }
 
+function normalizeLoopbackOrigin(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > 256) return undefined;
+  try {
+    const parsed = new URL(value);
+    const loopback =
+      parsed.hostname === "127.0.0.1" ||
+      parsed.hostname === "localhost" ||
+      parsed.hostname === "[::1]";
+    if (
+      !loopback ||
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+      parsed.username ||
+      parsed.password ||
+      parsed.pathname !== "/" ||
+      parsed.search ||
+      parsed.hash
+    ) {
+      return undefined;
+    }
+    return parsed.origin;
+  } catch {
+    return undefined;
+  }
+}
+
 async function sendHello() {
   await sendBridgeMessage({
     v: BRIDGE_PROTOCOL_VERSION,
     kind: "hello",
     profileId: await getProfileId(),
     extensionId: chrome.runtime.id,
+    extensionVersion: chrome.runtime.getManifest().version,
     chromeVersion: chromeVersion(),
     tabs: await allTabs(),
   });

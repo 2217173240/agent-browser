@@ -9,13 +9,18 @@ import { BridgeDaemon } from "../dist/daemon/server.js";
 
 test("daemon validates CDP tokens and routes core CDP traffic through the extension bridge", async () => {
   const port = await freePort();
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = new BridgeDaemon({
+    port,
+    commandTimeoutMs: 5000,
+    supervisedByNexolyra: true,
+  });
   await daemon.start();
   const extension = await connectExtension(port, "profile-a", [
     { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
   ]);
 
   try {
+    assert.equal((await fetchJson(port, "/health")).supervisedByNexolyra, true);
     await assertInvalidToken(port);
 
     const session = await postJson(port, "/sessions", {});
@@ -137,6 +142,7 @@ test("daemon selects the owning profile and isolates a host session in its own t
   try {
     const session = await postJson(port, "/sessions", {
       profileUrlHint: "/session/674fb240-55e4-427e-a544-60c5b22226f0/",
+      returnOrigin: "http://127.0.0.1:3458",
       ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
     });
     const cdp = await connectCdp(port, session.sessionId, session.token);
@@ -177,6 +183,11 @@ test("daemon selects the owning profile and isolates a host session in its own t
       params: { targetId: created.result.targetId, flatten: true },
     });
     assert.match(attached.result.sessionId, /^session:/);
+    const agentOverlay = owning.commands.findLast(
+      (command) => command.method === "Bridge.setControlOverlay" && command.params.phase === "agent",
+    );
+    assert.equal(agentOverlay.params.returnPath, undefined);
+    assert.equal(agentOverlay.params.returnOrigin, undefined);
 
     const targets = await cdpCommand(cdp, {
       id: 4,
@@ -196,6 +207,11 @@ test("daemon selects the owning profile and isolates a host session in its own t
     });
     assert.equal(takeover.matched, 1);
     assert.equal(takeover.focusConfirmed, true);
+    const humanOverlay = owning.commands.findLast(
+      (command) => command.method === "Bridge.setControlOverlay" && command.params.phase === "human",
+    );
+    assert.equal(humanOverlay.params.returnPath, "/session/674fb240-55e4-427e-a544-60c5b22226f0");
+    assert.equal(humanOverlay.params.returnOrigin, "http://127.0.0.1:3458");
     assert.ok(
       owning.commands.some(
         (command) => command.method === "Bridge.activateTab" && command.tabId === 303,
@@ -365,6 +381,7 @@ test("page takeover fences queued and future CDP commands and emits a bounded ow
     const events = await fetchJson(port, "/control/events?after=0");
     assert.equal(events.events[0].ownerSessionId, "nex-aaaaaaaaaaaaaaaa");
     assert.equal(events.events[0].action, "takeover");
+    assert.equal(events.events[0].targetId, "tab:profile-a:101");
     assert.equal(events.events[0].pendingActionRisk, false);
 
     const resumed = await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", {
@@ -427,6 +444,7 @@ test("external tab detachment is recoverable and does not become user Stop", asy
       action: "detach",
       reason: "tab_closed",
       tabId: 101,
+      targetId: "tab:profile-a:101",
       pendingActionRisk: false,
       createdAt: events.events[0].createdAt,
     });
@@ -458,6 +476,7 @@ test("reconnect selects the Nex session tab and preserves the CDP attachment id"
     const session = await postJson(port, "/sessions", {
       ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
       profileUrlHint: "/session/session-a",
+      returnOrigin: "http://127.0.0.1:3458",
     });
     const cdp = await connectCdp(port, session.sessionId, session.token);
     const attached = await cdpCommand(cdp, {
@@ -514,7 +533,8 @@ test("reconnect selects the Nex session tab and preserves the CDP attachment id"
           command.tabId === 202 &&
           command.sessionId === oldAttachmentId &&
           command.params.phase === "agent" &&
-          command.params.returnPath === "/session/session-a",
+          command.params.returnPath === undefined &&
+          command.params.returnOrigin === undefined,
       ),
     );
 
@@ -789,6 +809,7 @@ test("daemon restart rehydrates an owner session and preserves its bridge token"
         action: "detach",
         reason: "extension_disconnected",
         tabId: 101,
+        targetId: "tab:profile-a:101",
         pendingActionRisk: true,
         createdAt: recoveredEvents.events[0].createdAt,
       });
@@ -817,6 +838,92 @@ test("daemon restart rehydrates an owner session and preserves its bridge token"
     firstExtension.close();
     await firstDaemon.stop().catch(() => undefined);
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("session creation rejects non-loopback return origins", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  try {
+    for (const returnOrigin of [
+      "https://evil.example",
+      "http://127.0.0.1:3458/extra",
+      "http://user:pass@127.0.0.1:3458",
+    ]) {
+      const response = await fetch(`http://127.0.0.1:${port}/sessions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ returnOrigin }),
+      });
+      assert.equal(response.status, 400);
+      assert.match((await response.json()).error, /returnOrigin/);
+    }
+    const accepted = await postJson(port, "/sessions", {
+      returnOrigin: "http://localhost:3458",
+    });
+    assert.equal(accepted.returnOrigin, "http://localhost:3458");
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("human control never focuses an arbitrary unscoped browser tab", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://unrelated.example", title: "Unrelated", active: true },
+  ]);
+  try {
+    await postJson(port, "/sessions", { ownerSessionId: "nex-aaaaaaaaaaaaaaaa" });
+    const takeover = await postJson(port, "/control/sessions/nex-aaaaaaaaaaaaaaaa", {
+      phase: "human",
+    });
+    assert.equal(takeover.focusConfirmed, false);
+    assert.equal(
+      extension.commands.some((command) => command.method === "Bridge.activateTab"),
+      false,
+    );
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
+test("control HTTP reports provider focus rejection instead of hanging the request", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
+  ]);
+  try {
+    const session = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+    });
+    const cdp = await connectCdp(port, session.sessionId, session.token);
+    await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:101", flatten: true },
+    });
+    extension.failMethods.add("Bridge.activateTab");
+    const response = await fetch(
+      `http://127.0.0.1:${port}/control/sessions/nex-aaaaaaaaaaaaaaaa`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ phase: "human" }),
+        signal: AbortSignal.timeout(1_000),
+      },
+    );
+    assert.equal(response.status, 409);
+    assert.match((await response.json()).error, /focus rejected/);
+    cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
   }
 });
 
@@ -901,11 +1008,23 @@ test("daemon routes CDP events only to the owning bridge session", async () => {
 async function connectExtension(port, profileId, tabs) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
   ws.commands = [];
+  ws.failMethods = new Set();
   await onceOpen(ws);
   ws.on("message", (raw) => {
     const message = JSON.parse(String(raw));
     if (message.kind !== "cdp-command") return;
     ws.commands.push(message);
+    if (ws.failMethods.has(message.method)) {
+      ws.send(
+        JSON.stringify({
+          v: 1,
+          kind: "cdp-result",
+          reqId: message.reqId,
+          error: { code: -32000, message: "focus rejected" },
+        }),
+      );
+      return;
+    }
     if (message.method === "Bridge.createTab") {
       const tab = {
         tabId: 202,
@@ -970,6 +1089,7 @@ async function connectExtension(port, profileId, tabs) {
       kind: "hello",
       profileId,
       extensionId: "extension-id",
+      extensionVersion: "0.31.1",
       chromeVersion: "120.0.0.0",
       tabs,
     }),

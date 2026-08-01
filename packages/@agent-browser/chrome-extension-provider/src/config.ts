@@ -7,10 +7,12 @@ export type BridgeConfig = {
   port: number;
   profileId?: string;
   profileUrlHint?: string;
+  returnOrigin?: string;
   daemonCommand?: string;
   extensionId?: string;
   logPath?: string;
   statePath?: string;
+  supervisedByNexolyra: boolean;
 };
 
 export function readBridgeConfig(env: NodeJS.ProcessEnv = process.env): BridgeConfig {
@@ -19,12 +21,14 @@ export function readBridgeConfig(env: NodeJS.ProcessEnv = process.env): BridgeCo
     port: parsePort(env.AGENT_BROWSER_CHROME_BRIDGE_PORT),
     profileId: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE),
     profileUrlHint: parseProfileUrlHint(env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT),
+    returnOrigin: parseReturnOrigin(env.AGENT_BROWSER_CHROME_BRIDGE_RETURN_ORIGIN),
     daemonCommand: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_DAEMON),
     extensionId: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID),
     logPath,
     statePath:
       nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_STATE) ||
       join(logPath ? dirname(logPath) : process.cwd(), "sessions.json"),
+    supervisedByNexolyra: env.NEXOLYRA_AGENT_BROWSER_DAEMON_SUPERVISED === "1",
   };
 }
 
@@ -48,6 +52,35 @@ export function parseProfileUrlHint(value: string | undefined): string | undefin
     );
   }
   return hint.length > 1 ? hint.replace(/\/+$/, "") : hint;
+}
+
+export function parseReturnOrigin(value: string | undefined): string | undefined {
+  const candidate = nonEmpty(value);
+  if (!candidate) return undefined;
+  try {
+    const parsed = new URL(candidate);
+    const loopback =
+      parsed.hostname === "127.0.0.1" ||
+      parsed.hostname === "localhost" ||
+      parsed.hostname === "[::1]";
+    if (
+      !loopback ||
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+      parsed.username ||
+      parsed.password ||
+      parsed.pathname !== "/" ||
+      parsed.search ||
+      parsed.hash ||
+      candidate.length > 256
+    ) {
+      throw new Error("invalid return origin");
+    }
+    return parsed.origin;
+  } catch {
+    throw new Error(
+      "AGENT_BROWSER_CHROME_BRIDGE_RETURN_ORIGIN must be an HTTP(S) loopback origin",
+    );
+  }
 }
 
 export function defaultDaemonScriptUrl(): URL {
