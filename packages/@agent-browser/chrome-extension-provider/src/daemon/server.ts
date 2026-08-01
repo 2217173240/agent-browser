@@ -472,8 +472,26 @@ export class BridgeDaemon {
 
   private async handleHttp(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
+    if (req.method === "OPTIONS" && url.pathname === "/health") {
+      const corsHeaders = this.healthCorsHeaders(req);
+      if (!corsHeaders) {
+        this.writeJson(res, 403, { error: "extension origin is not allowed" });
+        return;
+      }
+      res.writeHead(204, {
+        ...corsHeaders,
+        "access-control-allow-methods": "GET, OPTIONS",
+        "access-control-allow-headers": "content-type",
+        ...(req.headers["access-control-request-private-network"] === "true"
+          ? { "access-control-allow-private-network": "true" }
+          : {}),
+        "access-control-max-age": "600",
+      });
+      res.end();
+      return;
+    }
     if (req.method === "GET" && url.pathname === "/health") {
-      this.writeJson(res, 200, this.status());
+      this.writeJson(res, 200, this.status(), this.healthCorsHeaders(req) ?? undefined);
       return;
     }
     if (req.method === "POST" && url.pathname === "/sessions") {
@@ -584,6 +602,9 @@ export class BridgeDaemon {
   private handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer) {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
     if (url.pathname === "/bridge") {
+      this.logger.debug("extension upgrade requested", {
+        origin: req.headers.origin ?? null,
+      });
       if (
         this.options.allowedExtensionId &&
         req.headers.origin !== `chrome-extension://${this.options.allowedExtensionId}`
@@ -940,11 +961,7 @@ export class BridgeDaemon {
           request.method === "Page.startScreencast"
             ? { ...request.params, ...LIVE_SCREENCAST_PARAMS }
             : request.method === "Page.captureScreenshot"
-              ? // Screenshots ride the debugger session so the extension needs
-                // no host permissions. Prefer fromSurface for occluded task
-                // windows, while preserving an explicit false used by the
-                // native stream's visible-surface fallback.
-                { fromSurface: true, ...captureParams }
+              ? { fromSurface: true, ...captureParams }
               : captureParams,
         sessionId: session.sessionId,
         tabId: session.tabId,
@@ -1548,6 +1565,11 @@ export class BridgeDaemon {
       profileId: peer.profileId,
       ...command,
     };
+    this.logger.debug("Chrome extension command dispatched", {
+      reqId,
+      method: payload.method,
+      profileId: peer.profileId,
+    });
     if (cdpClient && typeof cdpId === "number") {
       const timeout = setTimeout(() => {
         this.pending.delete(reqId);
@@ -1601,6 +1623,11 @@ export class BridgeDaemon {
   private resolvePending(message: BridgeResult) {
     const pending = this.pending.get(message.reqId);
     if (!pending) return;
+    this.logger.debug("Chrome extension command completed", {
+      reqId: message.reqId,
+      method: pending.method,
+      ok: !message.error,
+    });
     clearTimeout(pending.timeout);
     this.pending.delete(message.reqId);
     if (message.error) {
@@ -1667,11 +1694,28 @@ export class BridgeDaemon {
     ws.send(JSON.stringify({ id, error }));
   }
 
-  private writeJson(res: ServerResponse, statusCode: number, data: unknown) {
+  private healthCorsHeaders(req: IncomingMessage): Record<string, string> | undefined {
+    const allowedExtensionId = this.options.allowedExtensionId;
+    if (!allowedExtensionId) return undefined;
+    const allowedOrigin = `chrome-extension://${allowedExtensionId}`;
+    if (req.headers.origin !== allowedOrigin) return undefined;
+    return {
+      "access-control-allow-origin": allowedOrigin,
+      vary: "Origin",
+    };
+  }
+
+  private writeJson(
+    res: ServerResponse,
+    statusCode: number,
+    data: unknown,
+    headers: Record<string, string> = {},
+  ) {
     const body = JSON.stringify(data);
     res.writeHead(statusCode, {
       "content-type": "application/json; charset=utf-8",
       "content-length": Buffer.byteLength(body),
+      ...headers,
     });
     res.end(body);
   }

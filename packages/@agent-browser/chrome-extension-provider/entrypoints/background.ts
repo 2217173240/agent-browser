@@ -30,11 +30,13 @@ let activePort = DEFAULT_PORT;
 let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 let connectInFlight: Promise<void> | undefined;
 let profileIdInFlight: Promise<string> | undefined;
+let lastBridgeError: string | undefined;
 
 export default defineBackground(() => {
-  chrome.runtime.onInstalled.addListener(() => {
+  chrome.runtime.onInstalled.addListener((details) => {
     chrome.alarms.create("agent-browser-bridge-heartbeat", { periodInMinutes: 0.5 });
     void connectBridge();
+    if (details.reason === "install") void openOnboarding();
   });
   chrome.runtime.onStartup.addListener(() => {
     void connectBridge();
@@ -47,15 +49,35 @@ export default defineBackground(() => {
   chrome.action.onClicked.addListener(() => {
     void openOnboarding();
   });
-  // The onboarding page asks the worker for live bridge state instead of
-  // probing the daemon over HTTP; the worker already owns the WebSocket and
-  // extension pages have no host permissions for loopback fetches.
+  // The onboarding page asks the worker for live bridge state. On Chrome 147+
+  // it can also request a reconnect after its foreground loopback probe has
+  // obtained Local Network Access permission for the extension origin.
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if ((message as { kind?: unknown } | null)?.kind === "bridge-status-query") {
+    const kind = (message as { kind?: unknown } | null)?.kind;
+    if (kind === "bridge-status-query") {
       sendResponse({
         connected: bridge !== null && bridge.readyState === WebSocket.OPEN,
         port: activePort,
+        error: lastBridgeError,
       });
+      return false;
+    }
+    if (kind === "bridge-reconnect") {
+      void connectBridge().then(
+        () =>
+          sendResponse({
+            connected: bridge !== null && bridge.readyState === WebSocket.OPEN,
+            port: activePort,
+            error: lastBridgeError,
+          }),
+        (error) =>
+          sendResponse({
+            connected: false,
+            port: activePort,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+      );
+      return true;
     }
     return false;
   });
@@ -147,10 +169,12 @@ async function connectBridgeOnce(): Promise<void> {
     try {
       await openBridge(port);
       activePort = port;
+      lastBridgeError = undefined;
       void setBridgeBadge(true);
       return;
     } catch (error) {
       bridge = null;
+      lastBridgeError = error instanceof Error ? error.message : "bridge connection failed";
     }
   }
   void setBridgeBadge(false);
@@ -162,13 +186,27 @@ async function connectBridgeOnce(): Promise<void> {
 async function openBridge(port: number): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
-    const fail = () => reject(new Error("bridge connection failed"));
+    let settled = false;
+    const finish = (result: "resolve" | "reject", error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (result === "resolve") resolve();
+      else reject(error ?? new Error("bridge connection failed"));
+    };
+    const timeout = setTimeout(() => {
+      ws.close();
+      finish("reject", new Error("bridge connection timed out"));
+    }, 3000);
     ws.onopen = () => {
       bridge = ws;
       ws.onmessage = (event) => {
         void handleBridgeMessage(event.data);
       };
       ws.onclose = () => {
+        if (!settled) {
+          finish("reject", new Error("bridge connection closed before handshake"));
+        }
         // A stale socket must not clear a newer connection established while
         // the old close event was still in flight.
         if (bridge !== ws) return;
@@ -179,10 +217,16 @@ async function openBridge(port: number): Promise<void> {
         }, 1000);
       };
       ws.onerror = () => undefined;
-      void sendHello().then(resolve, reject);
+      void sendHello().then(
+        () => finish("resolve"),
+        (error) => finish("reject", error instanceof Error ? error : new Error(String(error))),
+      );
     };
     ws.onerror = () => {
-      fail();
+      finish("reject", new Error("bridge connection failed"));
+    };
+    ws.onclose = () => {
+      finish("reject", new Error("bridge connection closed before handshake"));
     };
   });
 }
@@ -661,11 +705,11 @@ function windowsCreate(createData: chrome.windows.CreateData): Promise<chrome.wi
 }
 
 function debuggerAttach(target: chrome.debugger.Debuggee, version: string): Promise<void> {
-  return chromeCall((done) => chrome.debugger.attach(target, version, done));
+  return chrome.debugger.attach(target, version);
 }
 
 function debuggerDetach(target: chrome.debugger.Debuggee): Promise<void> {
-  return chromeCall((done) => chrome.debugger.detach(target, done));
+  return chrome.debugger.detach(target);
 }
 
 function debuggerSendCommand(
@@ -673,7 +717,7 @@ function debuggerSendCommand(
   method: string,
   params: Record<string, unknown>,
 ): Promise<unknown> {
-  return chromeCall((done) => chrome.debugger.sendCommand(target, method, params, done));
+  return chrome.debugger.sendCommand(target, method, params);
 }
 
 function chromeCall<T>(fn: (done: (value: T) => void) => void): Promise<T> {

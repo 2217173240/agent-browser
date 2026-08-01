@@ -6,6 +6,10 @@ export default defineConfig({
     version: "0.31.1",
     minimum_chrome_version: "120",
     permissions: ["debugger", "tabs", "storage", "alarms"],
+    // This narrow grant is only for onboarding's loopback health probe. Page
+    // automation remains scoped to per-tab chrome.debugger sessions; the
+    // extension never receives blanket access to users' browsing origins.
+    host_permissions: ["http://127.0.0.1/*"],
     // Pins the current unpacked/self-hosted identity. Chrome Web Store assigns
     // its own signing identity: before the first Store release, reserve the
     // listing, replace this key with the Store-provided public key, and repin
@@ -16,7 +20,8 @@ export default defineConfig({
       default_title: "Agent Browser Bridge",
     },
     content_security_policy: {
-      extension_pages: "script-src 'self'; object-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*",
+      extension_pages:
+        "script-src 'self'; object-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*",
     },
   },
 });

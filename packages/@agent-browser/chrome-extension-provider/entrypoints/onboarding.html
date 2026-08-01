@@ -73,6 +73,36 @@
         line-height: 1.7;
         color: #374151;
       }
+      #permission-text,
+      #error-text {
+        margin: 12px 0 0;
+        font-size: 13px;
+        line-height: 1.6;
+      }
+      #permission-text {
+        color: #4b5563;
+      }
+      #error-text {
+        color: #b91c1c;
+      }
+      #action-button {
+        margin-top: 18px;
+        border: 0;
+        border-radius: 8px;
+        padding: 10px 14px;
+        background: #2563eb;
+        color: #ffffff;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 700;
+      }
+      #action-button:disabled {
+        cursor: wait;
+        opacity: 0.65;
+      }
+      [hidden] {
+        display: none !important;
+      }
     </style>
   </head>
   <body>
@@ -84,6 +114,9 @@
         <span id="status-text">Checking connection…</span>
       </div>
       <p id="port-text"></p>
+      <p id="permission-text" role="status" aria-live="polite"></p>
+      <p id="error-text" role="alert" hidden></p>
+      <button id="action-button" type="button" hidden></button>
       <p id="guidance-text"></p>
     </main>
     <script type="module" src="./onboarding/main.ts"></script>

@@ -84,7 +84,9 @@ When Nexolyra owns the daemon lifecycle it starts the process with an internal s
 
 When an extension id is configured, the daemon rejects `/bridge` upgrades unless the browser-supplied WebSocket Origin is `chrome-extension://<id>`, then checks the hello payload against the same id. This prevents a different installed extension from attaching accidentally or through ordinary browser APIs. It is not authentication against a hostile process already executing as the same operating-system user, because such a process can forge loopback HTTP headers; Nexolyra's local single-user trust boundary remains the outer boundary.
 
-The extension requests no host permissions. Every page capability rides the `chrome.debugger` session that Chrome grants per attached tab, so there is no blanket `<all_urls>` access and no per-origin installation step. Live remains event-driven through `Page.screencastFrame`; static screenshots and the one-frame Live viewport seed go through `Page.captureScreenshot` with `fromSurface`, which keeps occluded task windows returning pixels where the platform allows it.
+The extension uses `chrome.debugger` as its session-scoped page-control transport and never requests blanket `<all_urls>` access. Its only host permission is `http://127.0.0.1/*`, used by the foreground onboarding page to reach the daemon health endpoint and obtain Chrome's Local Network Access grant. Browser commands, screenshots, and event-driven Live frames continue through the debugger session attached to the task tab.
+
+Chrome 147 and newer gate WebSockets to loopback behind Local Network Access permission. A service worker cannot show that prompt itself, so a consumer install opens onboarding once and asks the user to allow the local connection before reconnecting the background bridge. Managed deployments may pregrant the extension origin with Chrome's `LoopbackNetworkAllowedForUrls` policy.
 
 ## Distribution identity
 

@@ -137,6 +137,28 @@ test("daemon accepts only the pinned Chrome extension origin and identity", asyn
   try {
     const health = await fetchJson(port, "/health");
     assert.equal(health.allowedExtensionId, extensionId);
+    const extensionOrigin = `chrome-extension://${extensionId}`;
+    const trustedHealth = await fetch(`http://127.0.0.1:${port}/health`, {
+      headers: { Origin: extensionOrigin },
+    });
+    assert.equal(trustedHealth.status, 200);
+    assert.equal(trustedHealth.headers.get("access-control-allow-origin"), extensionOrigin);
+    assert.equal(trustedHealth.headers.get("vary"), "Origin");
+    const preflight = await fetch(`http://127.0.0.1:${port}/health`, {
+      method: "OPTIONS",
+      headers: {
+        Origin: extensionOrigin,
+        "Access-Control-Request-Private-Network": "true",
+      },
+    });
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers.get("access-control-allow-origin"), extensionOrigin);
+    assert.equal(preflight.headers.get("access-control-allow-private-network"), "true");
+    const untrustedPreflight = await fetch(`http://127.0.0.1:${port}/health`, {
+      method: "OPTIONS",
+      headers: { Origin: "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+    });
+    assert.equal(untrustedPreflight.status, 403);
     await assertBridgeUpgradeRejected(port);
     await assertBridgeUpgradeRejected(port, "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
