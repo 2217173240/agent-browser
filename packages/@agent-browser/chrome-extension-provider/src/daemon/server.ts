@@ -1193,7 +1193,7 @@ export class BridgeDaemon {
     const sessions = [...this.bridgeSessions.values()].filter(
       (session) => session.ownerSessionId === ownerSessionId,
     );
-    let focusConfirmed = phase !== "human";
+    let focusConfirmed = true;
     let focusAttempted = false;
     for (const session of sessions) {
       const hasAttachedTarget = this.hasFocusableTarget(session);
