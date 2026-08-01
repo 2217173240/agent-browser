@@ -953,7 +953,10 @@ export class BridgeDaemon {
       method: "Bridge.setControlOverlay",
       sessionId: attached.sessionId,
       tabId: attached.tabId,
-      params: { phase },
+      params: {
+        phase,
+        ...(bridgeSession.profileUrlHint ? { returnPath: bridgeSession.profileUrlHint } : {}),
+      },
     });
   }
 
@@ -1274,7 +1277,10 @@ export class BridgeDaemon {
         method: "Bridge.setControlOverlay",
         sessionId: entry.sessionId,
         tabId: entry.tabId,
-        params: { phase },
+        params: {
+          phase,
+          ...(session.profileUrlHint ? { returnPath: session.profileUrlHint } : {}),
+        },
       });
       if (phase === "stopped") {
         this.sendBridgeNotification(peer, {

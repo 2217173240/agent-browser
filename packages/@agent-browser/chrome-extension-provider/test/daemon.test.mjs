@@ -512,7 +512,9 @@ test("reconnect selects the Nex session tab and preserves the CDP attachment id"
         (command) =>
           command.method === "Bridge.setControlOverlay" &&
           command.tabId === 202 &&
-          command.sessionId === oldAttachmentId,
+          command.sessionId === oldAttachmentId &&
+          command.params.phase === "agent" &&
+          command.params.returnPath === "/session/session-a",
       ),
     );
 

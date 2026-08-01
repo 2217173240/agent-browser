@@ -21,6 +21,7 @@ const controlOverlays = new Map<
     nonce: string;
     sessionId: string;
     phase: "agent" | "human" | "stopped";
+    returnPath?: string;
   }
 >();
 let bridge: WebSocket | null = null;
@@ -253,12 +254,17 @@ async function executeCommand(command: BridgeCommand): Promise<unknown> {
     if (phase !== "agent" && phase !== "human" && phase !== "stopped") {
       throw new Error("Bridge.setControlOverlay requires a valid phase");
     }
+    const returnPath =
+      typeof command.params?.returnPath === "string" && command.params.returnPath.startsWith("/")
+        ? command.params.returnPath.slice(0, 512)
+        : undefined;
     await ensureDebuggerAttached(tabId);
     const current = controlOverlays.get(tabId);
     const overlay = {
       nonce: current?.sessionId === sessionId ? current.nonce : crypto.randomUUID(),
       sessionId,
       phase,
+      ...(returnPath ? { returnPath } : {}),
     };
     controlOverlays.set(tabId, overlay);
     await injectControlOverlay(tabId, overlay);
@@ -303,7 +309,13 @@ function handleControlBinding(tabId: number, params: unknown): boolean {
   try {
     const payload = JSON.parse(value.payload) as { nonce?: unknown; action?: unknown };
     if (payload.nonce !== overlay.nonce) return true;
-    if (payload.action !== "takeover" && payload.action !== "stop") return true;
+    if (payload.action !== "takeover" && payload.action !== "stop" && payload.action !== "return")
+      return true;
+    if (payload.action === "return") {
+      if (overlay.phase !== "human" || !overlay.returnPath) return true;
+      void activateNexolyraTab(overlay.returnPath).catch(() => undefined);
+      return true;
+    }
     if (overlay.phase !== "agent" && payload.action === "takeover") return true;
     void emitControlEvent(tabId, overlay.sessionId, payload.action as BridgeControlAction);
   } catch {
@@ -344,7 +356,12 @@ async function emitDetach(
 
 async function injectControlOverlay(
   tabId: number,
-  overlay: { nonce: string; sessionId: string; phase: "agent" | "human" | "stopped" },
+  overlay: {
+    nonce: string;
+    sessionId: string;
+    phase: "agent" | "human" | "stopped";
+    returnPath?: string;
+  },
 ): Promise<void> {
   await debuggerSendCommand({ tabId }, "Runtime.enable", {}).catch(() => undefined);
   await debuggerSendCommand({ tabId }, "Runtime.addBinding", { name: CONTROL_BINDING }).catch(
@@ -354,6 +371,7 @@ async function injectControlOverlay(
     binding: CONTROL_BINDING,
     nonce: overlay.nonce,
     phase: overlay.phase,
+    returnPath: overlay.returnPath,
   });
   const expression = `(() => {
     const config = ${config};
@@ -381,6 +399,9 @@ async function injectControlOverlay(
       return node;
     };
     if (config.phase === "agent") bar.append(button("Take over", "takeover", true));
+    if (config.phase === "human" && config.returnPath) {
+      bar.append(button("Return to Nexolyra", "return", true));
+    }
     if (config.phase !== "stopped") bar.append(button("Stop", "stop", false));
     shadow.append(bar);
     (document.documentElement || document.body)?.append(host);
@@ -390,6 +411,25 @@ async function injectControlOverlay(
     awaitPromise: false,
     returnByValue: true,
   });
+}
+
+async function activateNexolyraTab(returnPath: string): Promise<void> {
+  const normalized = returnPath.endsWith("/") ? returnPath : `${returnPath}/`;
+  const tabs = await tabsQuery({});
+  const target = tabs.find((tab) => {
+    if (typeof tab.id !== "number" || typeof tab.windowId !== "number" || !tab.url) return false;
+    try {
+      const pathname = new URL(tab.url).pathname;
+      return pathname === returnPath || pathname === normalized || pathname.endsWith(returnPath);
+    } catch {
+      return false;
+    }
+  });
+  if (!target?.id || target.windowId === undefined) {
+    throw new Error("Nexolyra task tab is not open");
+  }
+  await tabsUpdate(target.id, { active: true });
+  await windowsUpdate(target.windowId, { focused: true });
 }
 
 async function sendHello() {
