@@ -195,6 +195,7 @@ test("daemon selects the owning profile and isolates a host session in its own t
       phase: "human",
     });
     assert.equal(takeover.matched, 1);
+    assert.equal(takeover.focusConfirmed, true);
     assert.ok(
       owning.commands.some(
         (command) => command.method === "Bridge.activateTab" && command.tabId === 303,
