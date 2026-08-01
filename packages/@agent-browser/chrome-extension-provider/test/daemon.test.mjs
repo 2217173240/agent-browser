@@ -318,6 +318,8 @@ test("page takeover fences queued and future CDP commands and emits a bounded ow
       const events = await fetchJson(port, "/control/events?after=0");
       return events.events.length === 1;
     });
+    const eventStream = await fetchJson(port, "/control/events?after=0");
+    assert.match(eventStream.streamId, /^[0-9a-f-]{36}$/);
 
     const blocked = await cdpCommand(cdp, {
       id: 2,

@@ -159,6 +159,7 @@ export class BridgeDaemon {
   private readonly controlEvents: QueuedControlEvent[] = [];
   private readonly pending = new Map<string, PendingCommand>();
   private readonly cdpClients = new Map<WebSocket, string>();
+  private readonly controlEventStreamId = randomUUID();
   private attachSequence = 1;
   private commandSequence = 1;
   private controlEventSequence = 0;
@@ -468,6 +469,7 @@ export class BridgeDaemon {
     if (req.method === "GET" && url.pathname === "/control/events") {
       const after = Math.max(0, Number.parseInt(url.searchParams.get("after") || "0", 10) || 0);
       this.writeJson(res, 200, {
+        streamId: this.controlEventStreamId,
         sequence: this.controlEventSequence,
         events: this.controlEvents.filter((event) => event.sequence > after),
       });
