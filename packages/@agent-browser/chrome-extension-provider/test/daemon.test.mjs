@@ -777,6 +777,18 @@ test("daemon restart rehydrates an owner session and preserves its bridge token"
       const health = await fetchJson(secondPort, "/health");
       assert.equal(health.sessions[0].sessionId, session.sessionId);
       assert.equal(health.sessions[0].control.phase, "detached");
+      const recoveredEvents = await fetchJson(secondPort, "/control/events?after=0");
+      assert.equal(recoveredEvents.events.length, 1);
+      assert.deepEqual(recoveredEvents.events[0], {
+        sequence: 1,
+        ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+        bridgeSessionId: session.sessionId,
+        action: "detach",
+        reason: "extension_disconnected",
+        tabId: 101,
+        pendingActionRisk: true,
+        createdAt: recoveredEvents.events[0].createdAt,
+      });
       const reconnected = await postJson(
         secondPort,
         "/control/sessions/nex-aaaaaaaaaaaaaaaa/reconnect",

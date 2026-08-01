@@ -401,6 +401,18 @@ export class BridgeDaemon {
       ) {
         this.detachedAttachments.set(session.sessionId, entry.detachedAttachment);
       }
+      // The previous daemon may have shut down after persisting the session,
+      // so its in-memory event queue is gone. Re-emit the lifecycle boundary
+      // for Nexolyra before accepting a reconnect; otherwise the provider is
+      // detached while the coordinator still believes it is agent-owned.
+      this.enqueueControlEvent({
+        ownerSessionId: session.ownerSessionId,
+        bridgeSessionId: session.sessionId,
+        action: "detach",
+        reason: "extension_disconnected",
+        tabId: entry.detachedAttachment?.tabId ?? 0,
+        pendingActionRisk: true,
+      });
     }
     this.persistSessions();
   }
