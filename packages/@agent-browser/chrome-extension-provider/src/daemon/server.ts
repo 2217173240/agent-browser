@@ -496,8 +496,10 @@ export class BridgeDaemon {
         this.writeJson(res, 400, { error: "phase must be agent, human, or stopped" });
         return;
       }
+      const result = await this.setOwnerControl(ownerSessionId, phase);
       this.writeJson(res, 200, {
-        matched: await this.setOwnerControl(ownerSessionId, phase),
+        matched: result.matched,
+        focusConfirmed: result.focusConfirmed,
       });
       return;
     }
@@ -1184,17 +1186,36 @@ export class BridgeDaemon {
     throw new Error("Reconnect requires an explicit targetId because multiple Chrome tabs match");
   }
 
-  private async setOwnerControl(ownerSessionId: string, phase: ControlPhase): Promise<number> {
+  private async setOwnerControl(
+    ownerSessionId: string,
+    phase: ControlPhase,
+  ): Promise<{ matched: number; focusConfirmed: boolean }> {
     const sessions = [...this.bridgeSessions.values()].filter(
       (session) => session.ownerSessionId === ownerSessionId,
     );
-    for (const session of sessions) await this.setBridgeControl(session, phase);
-    return sessions.length;
+    let focusConfirmed = phase !== "human";
+    let focusAttempted = false;
+    for (const session of sessions) {
+      const hasAttachedTarget = [...this.attachedSessions.values()].some(
+        (entry) => entry.bridgeSessionId === session.sessionId,
+      );
+      const focused = await this.setBridgeControl(session, phase);
+      if (phase === "human" && hasAttachedTarget) {
+        focusAttempted = true;
+        focusConfirmed = focusConfirmed && focused;
+      }
+    }
+    return {
+      matched: sessions.length,
+      focusConfirmed: phase === "human" ? focusAttempted && focusConfirmed : focusConfirmed,
+    };
   }
 
-  private async setBridgeControl(session: BridgeSession, phase: ControlPhase): Promise<void> {
+  private async setBridgeControl(session: BridgeSession, phase: ControlPhase): Promise<boolean> {
     const current = this.controlStates.get(session.sessionId);
-    if (current?.phase === phase) return;
+    // Repeating human control is an explicit focus request from the UI. It
+    // must re-activate the exact tab/window instead of becoming a no-op.
+    if (current?.phase === phase && phase !== "human") return true;
     this.controlStates.set(session.sessionId, {
       phase,
       epoch: (current?.epoch ?? 0) + 1,
@@ -1207,8 +1228,9 @@ export class BridgeDaemon {
     if (phase === "detached") {
       for (const entry of attached) this.attachedSessions.delete(entry.sessionId);
       this.persistSessions();
-      return;
+      return true;
     }
+    let focusConfirmed = phase !== "human";
     if (phase === "human") {
       const focused =
         attached.find(
@@ -1223,6 +1245,7 @@ export class BridgeDaemon {
           tabId: focused.tabId,
           params: { tabId: focused.tabId },
         });
+        focusConfirmed = true;
       }
     }
     for (const entry of attached) {
@@ -1247,6 +1270,7 @@ export class BridgeDaemon {
       }
     }
     this.persistSessions();
+    return focusConfirmed;
   }
 
   private cancelPendingForSession(bridgeSessionId: string, phase: ControlPhase): void {
