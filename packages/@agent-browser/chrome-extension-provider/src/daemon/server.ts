@@ -1198,6 +1198,13 @@ export class BridgeDaemon {
     for (const session of sessions) {
       const hasAttachedTarget = this.hasFocusableTarget(session);
       const focused = await this.setBridgeControl(session, phase);
+      this.logger.debug("owner control update", {
+        ownerSessionId,
+        sessionId: session.sessionId,
+        phase,
+        hasFocusableTarget: hasAttachedTarget,
+        focused,
+      });
       if (phase === "human" && hasAttachedTarget) {
         focusAttempted = true;
         focusConfirmed = focusConfirmed && focused;
