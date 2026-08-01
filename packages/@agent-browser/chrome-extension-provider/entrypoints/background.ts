@@ -44,6 +44,21 @@ export default defineBackground(() => {
       void connectBridge().then(() => sendHeartbeat());
     }
   });
+  chrome.action.onClicked.addListener(() => {
+    void openOnboarding();
+  });
+  // The onboarding page asks the worker for live bridge state instead of
+  // probing the daemon over HTTP; the worker already owns the WebSocket and
+  // extension pages have no host permissions for loopback fetches.
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if ((message as { kind?: unknown } | null)?.kind === "bridge-status-query") {
+      sendResponse({
+        connected: bridge !== null && bridge.readyState === WebSocket.OPEN,
+        port: activePort,
+      });
+    }
+    return false;
+  });
   chrome.tabs.onCreated.addListener(() => scheduleHeartbeat());
   chrome.tabs.onUpdated.addListener(() => scheduleHeartbeat());
   chrome.tabs.onActivated.addListener(() => scheduleHeartbeat());
@@ -100,6 +115,17 @@ export default defineBackground(() => {
   void connectBridge();
 });
 
+async function openOnboarding(): Promise<void> {
+  const url = chrome.runtime.getURL("onboarding.html");
+  const existing = (await tabsQuery({})).find((tab) => tab.url === url);
+  if (existing?.id !== undefined) {
+    await tabsUpdate(existing.id, { active: true });
+    if (existing.windowId !== undefined) await windowsUpdate(existing.windowId, { focused: true });
+    return;
+  }
+  await tabsCreate({ url, active: true });
+}
+
 async function connectBridge(): Promise<void> {
   if (bridge && bridge.readyState === WebSocket.OPEN) return;
   if (connectInFlight) return connectInFlight;
@@ -121,11 +147,13 @@ async function connectBridgeOnce(): Promise<void> {
     try {
       await openBridge(port);
       activePort = port;
+      void setBridgeBadge(true);
       return;
     } catch (error) {
       bridge = null;
     }
   }
+  void setBridgeBadge(false);
   reconnectTimer = setTimeout(() => {
     void connectBridge();
   }, 1000);
@@ -145,6 +173,7 @@ async function openBridge(port: number): Promise<void> {
         // the old close event was still in flight.
         if (bridge !== ws) return;
         bridge = null;
+        void setBridgeBadge(false);
         reconnectTimer = setTimeout(() => {
           void connectBridge();
         }, 1000);
@@ -188,33 +217,6 @@ async function executeCommand(command: BridgeCommand): Promise<unknown> {
       (window.id === undefined ? undefined : (await tabsQuery({ windowId: window.id }))[0]);
     if (!tab) throw new Error("Chrome did not create a task tab");
     return tabToBridgeTab(tab);
-  }
-  if (command.method === "Bridge.captureVisibleTab") {
-    const tabId = command.tabId ?? numberParam(command, "tabId");
-    const target = (await tabsQuery({})).find((candidate) => candidate.id === tabId);
-    if (!target || target.windowId === undefined) {
-      throw new Error(`Chrome task tab is unavailable: ${tabId}`);
-    }
-    if (!target.active) {
-      throw new Error("Chrome task tab is not active in its dedicated window");
-    }
-    const format = command.params?.format === "png" ? "png" : "jpeg";
-    const requestedQuality = command.params?.quality;
-    const quality =
-      typeof requestedQuality === "number"
-        ? Math.max(0, Math.min(100, Math.round(requestedQuality)))
-        : 60;
-    const dataUrl = await tabsCaptureVisibleTab(target.windowId, { format, quality });
-    const [activeAfterCapture] = await tabsQuery({
-      active: true,
-      windowId: target.windowId,
-    });
-    if (activeAfterCapture?.id !== tabId) {
-      throw new Error("Chrome task tab changed while capturing the Live frame");
-    }
-    const separator = dataUrl.indexOf(",");
-    if (separator < 0) throw new Error("Chrome returned an invalid captured frame");
-    return { data: dataUrl.slice(separator + 1) };
   }
   if (command.method === "Bridge.activateTab") {
     const tabId = numberParam(command, "tabId");
@@ -317,7 +319,9 @@ function handleControlBinding(tabId: number, params: unknown): boolean {
       return true;
     if (payload.action === "return") {
       if (overlay.phase !== "human" || !overlay.returnPath || !overlay.returnOrigin) return true;
-      void activateNexolyraTab(overlay.returnOrigin, overlay.returnPath).catch(() => undefined);
+      void activateNexolyraTab(overlay.returnOrigin, overlay.returnPath, tabId).catch((error) => {
+        console.warn("Unable to return to Nexolyra", error);
+      });
       return true;
     }
     if (overlay.phase !== "agent" && payload.action === "takeover") return true;
@@ -418,18 +422,30 @@ async function injectControlOverlay(
   });
 }
 
-async function activateNexolyraTab(returnOrigin: string, returnPath: string): Promise<void> {
+async function activateNexolyraTab(
+  returnOrigin: string,
+  returnPath: string,
+  controlledTabId: number,
+): Promise<void> {
   const trustedOrigin = normalizeLoopbackOrigin(returnOrigin);
   if (!trustedOrigin) throw new Error("Nexolyra return origin is not trusted");
+  const trustedOriginKey = canonicalLoopbackOrigin(new URL(trustedOrigin));
   const normalized = returnPath.endsWith("/") ? returnPath : `${returnPath}/`;
   const tabs = await tabsQuery({});
   const target = tabs.find((tab) => {
-    if (typeof tab.id !== "number" || typeof tab.windowId !== "number" || !tab.url) return false;
+    if (
+      typeof tab.id !== "number" ||
+      tab.id === controlledTabId ||
+      typeof tab.windowId !== "number" ||
+      !tab.url
+    ) {
+      return false;
+    }
     try {
       const parsed = new URL(tab.url);
       const pathname = parsed.pathname;
       return (
-        parsed.origin === trustedOrigin &&
+        canonicalLoopbackOrigin(parsed) === trustedOriginKey &&
         (pathname === returnPath || pathname === normalized || pathname.endsWith(returnPath))
       );
     } catch {
@@ -437,7 +453,14 @@ async function activateNexolyraTab(returnOrigin: string, returnPath: string): Pr
     }
   });
   if (!target?.id || target.windowId === undefined) {
-    throw new Error("Nexolyra task tab is not open");
+    // The Nexolyra tab may have been closed during human control; reopen the
+    // session instead of leaving the Return action silently dead. The origin
+    // is the daemon-validated loopback origin, never page-supplied input.
+    const created = await tabsCreate({ url: `${trustedOrigin}${returnPath}`, active: true });
+    if (created.windowId !== undefined) {
+      await windowsUpdate(created.windowId, { focused: true });
+    }
+    return;
   }
   await tabsUpdate(target.id, { active: true });
   await windowsUpdate(target.windowId, { focused: true });
@@ -466,6 +489,17 @@ function normalizeLoopbackOrigin(value: unknown): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+// localhost, 127.0.0.1, and [::1] are equivalent for matching existing tabs.
+// Keep the configured origin unchanged when opening a tab so an HTTPS
+// certificate issued only for localhost is never rewritten to an IP address.
+function canonicalLoopbackOrigin(parsed: URL): string {
+  const host =
+    parsed.hostname === "localhost" || parsed.hostname === "[::1]"
+      ? "127.0.0.1"
+      : parsed.hostname;
+  return `${parsed.protocol}//${host}${parsed.port ? `:${parsed.port}` : ""}`;
 }
 
 async function sendHello() {
@@ -519,6 +553,21 @@ async function configuredPorts(): Promise<number[]> {
     DEFAULT_PORT,
   ];
   return [...new Set(ports.filter((port) => Number.isInteger(port) && port > 0 && port <= 65535))];
+}
+
+async function setBridgeBadge(connected: boolean): Promise<void> {
+  if (connected) {
+    await chromeCall<void>((done) => chrome.action.setBadgeText({ text: "" }, done)).catch(
+      () => undefined,
+    );
+    return;
+  }
+  await chromeCall<void>((done) =>
+    chrome.action.setBadgeBackgroundColor({ color: "#dc2626" }, done),
+  ).catch(() => undefined);
+  await chromeCall<void>((done) => chrome.action.setBadgeText({ text: "OFF" }, done)).catch(
+    () => undefined,
+  );
 }
 
 async function getProfileId(): Promise<string> {
@@ -594,13 +643,6 @@ function tabsUpdate(
 
 function tabsRemove(tabId: number): Promise<void> {
   return chromeCall((done) => chrome.tabs.remove(tabId, done));
-}
-
-function tabsCaptureVisibleTab(
-  windowId: number,
-  options: chrome.tabs.ImageDetails,
-): Promise<string> {
-  return chromeCall((done) => chrome.tabs.captureVisibleTab(windowId, options, done));
 }
 
 function windowsUpdate(

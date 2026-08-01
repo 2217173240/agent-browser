@@ -23,13 +23,24 @@ export function readBridgeConfig(env: NodeJS.ProcessEnv = process.env): BridgeCo
     profileUrlHint: parseProfileUrlHint(env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT),
     returnOrigin: parseReturnOrigin(env.AGENT_BROWSER_CHROME_BRIDGE_RETURN_ORIGIN),
     daemonCommand: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_DAEMON),
-    extensionId: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID),
+    extensionId: parseExtensionId(env.AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID),
     logPath,
     statePath:
       nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_STATE) ||
       join(logPath ? dirname(logPath) : process.cwd(), "sessions.json"),
     supervisedByNexolyra: env.NEXOLYRA_AGENT_BROWSER_DAEMON_SUPERVISED === "1",
   };
+}
+
+export function parseExtensionId(value: string | undefined): string | undefined {
+  const extensionId = nonEmpty(value);
+  if (!extensionId) return undefined;
+  if (!/^[a-p]{32}$/.test(extensionId)) {
+    throw new Error(
+      "AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID must be a 32-character Chrome extension id",
+    );
+  }
+  return extensionId;
 }
 
 export function parsePort(value: string | undefined): number {

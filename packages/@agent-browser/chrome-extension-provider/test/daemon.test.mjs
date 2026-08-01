@@ -5,7 +5,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import WebSocket from "ws";
+import { parseExtensionId } from "../dist/config.js";
 import { BridgeDaemon } from "../dist/daemon/server.js";
+
+test("extension allowlist configuration accepts only canonical Chrome ids", () => {
+  assert.equal(parseExtensionId(undefined), undefined);
+  assert.equal(
+    parseExtensionId(" pimcamjccpkgapdpecfiadkemnggggbj "),
+    "pimcamjccpkgapdpecfiadkemnggggbj",
+  );
+  assert.throws(() => parseExtensionId("extension-id"), /32-character Chrome extension id/);
+});
 
 test("daemon validates CDP tokens and routes core CDP traffic through the extension bridge", async () => {
   const port = await freePort();
@@ -72,15 +82,36 @@ test("daemon validates CDP tokens and routes core CDP traffic through the extens
     assert.ok(
       extension.commands.some(
         (command) =>
-          command.method === "Bridge.captureVisibleTab" &&
+          command.method === "Page.captureScreenshot" &&
           command.tabId === 202 &&
           command.params.format === "jpeg" &&
-          command.params.quality === 60,
+          command.params.quality === 60 &&
+          command.params.fromSurface === true,
+      ),
+    );
+
+    const visibleSurfaceFallback = await cdpCommand(cdp, {
+      id: 6,
+      sessionId: attached.result.sessionId,
+      method: "Page.captureScreenshot",
+      params: {
+        format: "jpeg",
+        quality: 55,
+        fromSurface: false,
+      },
+    });
+    assert.equal(visibleSurfaceFallback.result.data, "base64-frame");
+    assert.ok(
+      extension.commands.some(
+        (command) =>
+          command.method === "Page.captureScreenshot" &&
+          command.params.quality === 55 &&
+          command.params.fromSurface === false,
       ),
     );
 
     const closed = await cdpCommand(cdp, {
-      id: 6,
+      id: 7,
       method: "Browser.close",
       params: {},
     });
@@ -89,6 +120,51 @@ test("daemon validates CDP tokens and routes core CDP traffic through the extens
     cdp.close();
   } finally {
     extension.close();
+    await daemon.stop();
+  }
+});
+
+test("daemon accepts only the pinned Chrome extension origin and identity", async () => {
+  const extensionId = "pimcamjccpkgapdpecfiadkemnggggbj";
+  const port = await freePort();
+  const daemon = new BridgeDaemon({
+    port,
+    commandTimeoutMs: 5000,
+    allowedExtensionId: extensionId,
+  });
+  await daemon.start();
+
+  try {
+    const health = await fetchJson(port, "/health");
+    assert.equal(health.allowedExtensionId, extensionId);
+    await assertBridgeUpgradeRejected(port);
+    await assertBridgeUpgradeRejected(port, "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    const wrongIdentity = new WebSocket(`ws://127.0.0.1:${port}/bridge`, {
+      headers: { Origin: `chrome-extension://${extensionId}` },
+    });
+    await onceOpen(wrongIdentity);
+    const rejected = onceJsonMessage(wrongIdentity);
+    wrongIdentity.send(
+      JSON.stringify({
+        v: 1,
+        kind: "hello",
+        profileId: "wrong-profile",
+        extensionId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        extensionVersion: "0.31.1",
+        chromeVersion: "120.0.0.0",
+        tabs: [],
+      }),
+    );
+    assert.match((await rejected).message, /not allowed/i);
+    wrongIdentity.close();
+
+    const extension = await connectExtension(port, "profile-a", [], {
+      extensionId,
+      origin: `chrome-extension://${extensionId}`,
+    });
+    extension.close();
+  } finally {
     await daemon.stop();
   }
 });
@@ -1007,8 +1083,11 @@ test("daemon routes CDP events only to the owning bridge session", async () => {
   }
 });
 
-async function connectExtension(port, profileId, tabs) {
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
+async function connectExtension(port, profileId, tabs, options = {}) {
+  const ws = new WebSocket(
+    `ws://127.0.0.1:${port}/bridge`,
+    options.origin ? { headers: { Origin: options.origin } } : undefined,
+  );
   ws.commands = [];
   ws.failMethods = new Set();
   await onceOpen(ws);
@@ -1063,7 +1142,7 @@ async function connectExtension(port, profileId, tabs) {
       );
       return;
     }
-    if (message.method === "Bridge.captureVisibleTab") {
+    if (message.method === "Page.captureScreenshot") {
       ws.send(
         JSON.stringify({
           v: 1,
@@ -1090,7 +1169,7 @@ async function connectExtension(port, profileId, tabs) {
       v: 1,
       kind: "hello",
       profileId,
-      extensionId: "extension-id",
+      extensionId: options.extensionId ?? "extension-id",
       extensionVersion: "0.31.1",
       chromeVersion: "120.0.0.0",
       tabs,
@@ -1101,6 +1180,35 @@ async function connectExtension(port, profileId, tabs) {
     return health.profiles.some((profile) => profile.profileId === profileId);
   });
   return ws;
+}
+
+async function assertBridgeUpgradeRejected(port, origin) {
+  await new Promise((resolve, reject) => {
+    const ws = new WebSocket(
+      `ws://127.0.0.1:${port}/bridge`,
+      origin ? { headers: { Origin: origin } } : undefined,
+    );
+    ws.on("unexpected-response", (_request, response) => {
+      assert.equal(response.statusCode, 403);
+      resolve();
+    });
+    ws.on("open", () => reject(new Error("untrusted extension origin unexpectedly connected")));
+    ws.on("error", () => undefined);
+  });
+}
+
+async function onceJsonMessage(ws) {
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timed out waiting for bridge response")), 5000);
+    ws.once("message", (raw) => {
+      clearTimeout(timer);
+      resolve(JSON.parse(String(raw)));
+    });
+    ws.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
 }
 
 async function assertInvalidToken(port) {

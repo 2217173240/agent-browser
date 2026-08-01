@@ -273,6 +273,7 @@ export class BridgeDaemon {
       daemon: "ok",
       version: CHROME_EXTENSION_PROVIDER_VERSION,
       bridgeProtocolVersion: BRIDGE_PROTOCOL_VERSION,
+      allowedExtensionId: this.options.allowedExtensionId ?? null,
       port: this.options.port,
       processId: process.pid,
       supervisedByNexolyra: this.options.supervisedByNexolyra === true,
@@ -583,6 +584,14 @@ export class BridgeDaemon {
   private handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer) {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
     if (url.pathname === "/bridge") {
+      if (
+        this.options.allowedExtensionId &&
+        req.headers.origin !== `chrome-extension://${this.options.allowedExtensionId}`
+      ) {
+        socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
       this.extensionWss.handleUpgrade(req, socket, head, (ws) => {
         this.extensionWss.emit("connection", ws, req);
       });
@@ -923,35 +932,23 @@ export class BridgeDaemon {
     const peer = this.profiles.get(session.profileId);
     if (!peer) throw new Error(`Profile is offline: ${session.profileId}`);
     const captureParams = request.params ?? {};
-    const useVisibleCapture =
-      request.method === "Page.captureScreenshot" &&
-      captureParams.clip === undefined &&
-      captureParams.captureBeyondViewport !== true &&
-      captureParams.fromSurface !== true &&
-      (captureParams.format === undefined ||
-        captureParams.format === "jpeg" ||
-        captureParams.format === "png");
     await this.sendBridgeCommand(
       peer,
-      useVisibleCapture
-        ? {
-            method: "Bridge.captureVisibleTab",
-            params: {
-              format: captureParams.format,
-              quality: captureParams.quality,
-            },
-            sessionId: session.sessionId,
-            tabId: session.tabId,
-          }
-        : {
-            method: request.method as string,
-            params:
-              request.method === "Page.startScreencast"
-                ? { ...request.params, ...LIVE_SCREENCAST_PARAMS }
-                : captureParams,
-            sessionId: session.sessionId,
-            tabId: session.tabId,
-          },
+      {
+        method: request.method as string,
+        params:
+          request.method === "Page.startScreencast"
+            ? { ...request.params, ...LIVE_SCREENCAST_PARAMS }
+            : request.method === "Page.captureScreenshot"
+              ? // Screenshots ride the debugger session so the extension needs
+                // no host permissions. Prefer fromSurface for occluded task
+                // windows, while preserving an explicit false used by the
+                // native stream's visible-surface fallback.
+                { fromSurface: true, ...captureParams }
+              : captureParams,
+        sessionId: session.sessionId,
+        tabId: session.tabId,
+      },
       ws,
       request.id as number,
       bridgeSession.sessionId,

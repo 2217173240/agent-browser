@@ -6,8 +6,12 @@ export default defineConfig({
     version: "0.31.1",
     minimum_chrome_version: "120",
     permissions: ["debugger", "tabs", "storage", "alarms"],
-    host_permissions: ["<all_urls>"],
-    optional_permissions: ["scripting"],
+    // Pins the current unpacked/self-hosted identity. Chrome Web Store assigns
+    // its own signing identity: before the first Store release, reserve the
+    // listing, replace this key with the Store-provided public key, and repin
+    // Nexolyra's release manifest once. The matching development private key
+    // lives outside this repository and is not needed by extension clients.
+    key: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqMfykuer8LcTC3oEsE6DYk5Fnq2WWVX31WX6Jyz8KQY0ItnG9qOjBj2uzHrE6mjcMsVx5D3pg7MRRpnDqb84nx5HA1g79pbsU/uD53Rzm3asGiHBHLNgGZHvMfb5GDHVM1wGVUbzRqGF50rh0fOk2oxSNBDQCLTjoGaNhe7VCHeJ2OWL88fGOAlPWE1zD+7x1WIpaU9Q6mVhx2Dofx4tZH04k4711l9NpyFJJCoRO93dMT40+9unxB3tfoahOlMIeRfw80Gw67+gZPiFLkZnaVDWo0wlBbEU/BvtRDI9DxiXu3tQTHfFUdHxYQbpq2TEVxA6kvpUdw6VcnihLcGFCQIDAQAB",
     action: {
       default_title: "Agent Browser Bridge",
     },
