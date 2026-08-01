@@ -26,6 +26,8 @@ const controlOverlays = new Map<
 let bridge: WebSocket | null = null;
 let activePort = DEFAULT_PORT;
 let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+let connectInFlight: Promise<void> | undefined;
+let profileIdInFlight: Promise<string> | undefined;
 
 export default defineBackground(() => {
   chrome.runtime.onInstalled.addListener(() => {
@@ -98,6 +100,16 @@ export default defineBackground(() => {
 
 async function connectBridge(): Promise<void> {
   if (bridge && bridge.readyState === WebSocket.OPEN) return;
+  if (connectInFlight) return connectInFlight;
+  connectInFlight = connectBridgeOnce();
+  try {
+    await connectInFlight;
+  } finally {
+    connectInFlight = undefined;
+  }
+}
+
+async function connectBridgeOnce(): Promise<void> {
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = undefined;
@@ -127,6 +139,9 @@ async function openBridge(port: number): Promise<void> {
         void handleBridgeMessage(event.data);
       };
       ws.onclose = () => {
+        // A stale socket must not clear a newer connection established while
+        // the old close event was still in flight.
+        if (bridge !== ws) return;
         bridge = null;
         reconnectTimer = setTimeout(() => {
           void connectBridge();
@@ -430,11 +445,19 @@ async function configuredPorts(): Promise<number[]> {
 }
 
 async function getProfileId(): Promise<string> {
-  const stored = await storageGet<StoredConfig>(["bridgeProfileId"]);
-  if (stored.bridgeProfileId) return stored.bridgeProfileId;
-  const bridgeProfileId = crypto.randomUUID();
-  await storageSet({ bridgeProfileId });
-  return bridgeProfileId;
+  if (profileIdInFlight) return profileIdInFlight;
+  profileIdInFlight = (async () => {
+    const stored = await storageGet<StoredConfig>(["bridgeProfileId"]);
+    if (stored.bridgeProfileId) return stored.bridgeProfileId;
+    const bridgeProfileId = crypto.randomUUID();
+    await storageSet({ bridgeProfileId });
+    return bridgeProfileId;
+  })();
+  try {
+    return await profileIdInFlight;
+  } finally {
+    profileIdInFlight = undefined;
+  }
 }
 
 async function allTabs(): Promise<BridgeTab[]> {
