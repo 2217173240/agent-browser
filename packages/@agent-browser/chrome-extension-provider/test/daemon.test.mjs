@@ -20,7 +20,9 @@ test("daemon validates CDP tokens and routes core CDP traffic through the extens
   ]);
 
   try {
-    assert.equal((await fetchJson(port, "/health")).supervisedByNexolyra, true);
+    const health = await fetchJson(port, "/health");
+    assert.equal(health.supervisedByNexolyra, true);
+    assert.equal(health.processId, process.pid);
     await assertInvalidToken(port);
 
     const session = await postJson(port, "/sessions", {});

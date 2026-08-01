@@ -274,6 +274,7 @@ export class BridgeDaemon {
       version: CHROME_EXTENSION_PROVIDER_VERSION,
       bridgeProtocolVersion: BRIDGE_PROTOCOL_VERSION,
       port: this.options.port,
+      processId: process.pid,
       supervisedByNexolyra: this.options.supervisedByNexolyra === true,
       profiles: [...this.profiles.values()].map((peer) => ({
         profileId: peer.profileId,
