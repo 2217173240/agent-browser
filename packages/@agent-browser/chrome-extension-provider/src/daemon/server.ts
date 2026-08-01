@@ -1196,9 +1196,7 @@ export class BridgeDaemon {
     let focusConfirmed = phase !== "human";
     let focusAttempted = false;
     for (const session of sessions) {
-      const hasAttachedTarget = [...this.attachedSessions.values()].some(
-        (entry) => entry.bridgeSessionId === session.sessionId,
-      );
+      const hasAttachedTarget = this.hasFocusableTarget(session);
       const focused = await this.setBridgeControl(session, phase);
       if (phase === "human" && hasAttachedTarget) {
         focusAttempted = true;
@@ -1236,14 +1234,25 @@ export class BridgeDaemon {
         attached.find(
           (entry) => this.profiles.get(entry.profileId)?.tabs.get(entry.tabId)?.active,
         ) ?? attached.at(-1);
-      const peer = focused ? this.profiles.get(focused.profileId) : undefined;
-      if (focused && peer?.ws.readyState === WebSocket.OPEN) {
+      let peer = focused ? this.profiles.get(focused.profileId) : undefined;
+      let tabId = focused?.tabId;
+      // A CLI command may have released its short-lived CDP attachment while
+      // the owner session still owns the task tab. The user-facing takeover
+      // contract must still focus that scoped tab instead of reporting a
+      // false negative merely because no CDP client is currently attached.
+      if (!focused) {
+        peer = this.trySelectProfile(session);
+        const scopedTabs = peer ? this.tabsForSession(session, peer).filter(shouldExposeTab) : [];
+        const fallback = scopedTabs.find((tab) => tab.active) ?? scopedTabs.at(-1);
+        tabId = fallback?.tabId;
+      }
+      if (peer?.ws.readyState === WebSocket.OPEN && typeof tabId === "number") {
         // Human takeover is not acknowledged to the host until Chrome has
         // confirmed that the exact controlled tab and its window were focused.
         await this.sendBridgeCommand(peer, {
           method: "Bridge.activateTab",
-          tabId: focused.tabId,
-          params: { tabId: focused.tabId },
+          tabId,
+          params: { tabId },
         });
         focusConfirmed = true;
       }
@@ -1271,6 +1280,14 @@ export class BridgeDaemon {
     }
     this.persistSessions();
     return focusConfirmed;
+  }
+
+  private hasFocusableTarget(session: BridgeSession): boolean {
+    if ([...this.attachedSessions.values()].some((entry) => entry.bridgeSessionId === session.sessionId)) {
+      return true;
+    }
+    const peer = this.trySelectProfile(session);
+    return Boolean(peer && this.tabsForSession(session, peer).some(shouldExposeTab));
   }
 
   private cancelPendingForSession(bridgeSessionId: string, phase: ControlPhase): void {
