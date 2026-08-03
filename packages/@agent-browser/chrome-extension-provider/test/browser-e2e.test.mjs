@@ -250,7 +250,7 @@ class MockExtensionBridge {
   }
 
   async executeCommand(command) {
-    if (command.method === "Bridge.createTab") {
+    if (command.method === "Bridge.createTab" || command.method === "Bridge.createWindow") {
       const url = typeof command.params?.url === "string" ? command.params.url : "about:blank";
       const target = await this.devtoolsJson(`/json/new?${encodeURIComponent(url)}`, { method: "PUT" });
       this.activeTargetId = target.id;
@@ -275,6 +275,23 @@ class MockExtensionBridge {
       this.tabIdsByTargetId.delete(targetId);
       await this.refreshTabs();
       return { success: true };
+    }
+    if (command.method === "Bridge.setControlOverlay") {
+      const tabId = command.tabId ?? command.params?.tabId;
+      if (typeof tabId !== "number") throw new Error("Bridge.setControlOverlay is missing tabId");
+      if (command.sessionId) this.sessionIdsByTabId.set(tabId, command.sessionId);
+      return { visible: true, phase: command.params?.phase };
+    }
+    if (command.method === "Bridge.detachTab") {
+      const tabId = command.tabId ?? command.params?.tabId;
+      if (typeof tabId !== "number") throw new Error("Bridge.detachTab is missing tabId");
+      const targetId = this.targetIdsByTabId.get(tabId);
+      if (targetId) {
+        this.targetClients.get(targetId)?.close();
+        this.targetClients.delete(targetId);
+      }
+      this.sessionIdsByTabId.delete(tabId);
+      return { detached: true };
     }
     if (typeof command.tabId !== "number") {
       throw new Error(`${command.method} is missing tabId`);
