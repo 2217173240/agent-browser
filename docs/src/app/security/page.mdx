@@ -138,7 +138,7 @@ agent-browser plugin run chrome-extension chrome-extension.status
 
 Credential plugins receive `credential.resolve` and return username, password, and optionally URL or selector metadata. Browser provider plugins receive `browser.launch` and return a CDP WebSocket URL. Launch mutator plugins receive `launch.mutate` and can append local launch args, extensions, or init script source before Chrome starts. Generic command plugins receive the request type passed to `plugin run`.
 
-The Chrome extension bridge provider is opt-in and only activates when selected with `--provider chrome-extension`. Its daemon listens on `127.0.0.1`, validates per-session CDP tokens, and treats `browser.close` as detach so it does not close the user's desktop Chrome.
+The Chrome extension bridge provider is opt-in and only activates when selected with `--provider chrome-extension`. Its daemon listens on `127.0.0.1`, pins bridge WebSocket connections to the bundled extension identity, validates per-session CDP tokens, and treats `browser.close` as detach so it does not close the user's desktop Chrome.
 
 `plugin run` is for `command.run` and custom capabilities. Core capabilities and protocol request types use their dedicated command paths so credential, browser-provider, and launch-mutator access stays inside the normal policy gates.
 

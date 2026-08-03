@@ -9,7 +9,9 @@ type BridgeStatus = {
   error?: string;
 };
 
-const DEFAULT_PORT = 19826;
+declare const __AGENT_BROWSER_BRIDGE_DEFAULT_PORT__: number;
+
+const DEFAULT_PORT = __AGENT_BROWSER_BRIDGE_DEFAULT_PORT__;
 const POLL_INTERVAL_MS = 2000;
 const RECONNECT_WAIT_MS = 6000;
 

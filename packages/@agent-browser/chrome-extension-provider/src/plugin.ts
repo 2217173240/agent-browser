@@ -125,11 +125,18 @@ async function statusResponse(): Promise<PluginResponse> {
 }
 
 async function ensureDaemon(port: number): Promise<void> {
-  if (await isHealthy(port)) return;
   const config = readBridgeConfig();
+  const existing = await readHealth(port);
+  if (existing?.daemon === "ok") {
+    assertCompatibleDaemon(existing, config.extensionId);
+    return;
+  }
   const env = {
     ...process.env,
     AGENT_BROWSER_CHROME_BRIDGE_PORT: String(port),
+    ...(config.extensionId
+      ? { AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID: config.extensionId }
+      : {}),
   };
   if (config.daemonCommand) {
     const child = spawn(config.daemonCommand, [], {
@@ -146,12 +153,20 @@ async function ensureDaemon(port: number): Promise<void> {
     });
     child.unref();
   }
-  await waitUntil(() => isHealthy(port), 10_000);
+  const ready = await waitUntil(async () => {
+    const health = await readHealth(port);
+    if (health?.daemon !== "ok") return false;
+    assertCompatibleDaemon(health, config.extensionId);
+    return true;
+  }, 10_000);
+  if (!ready) throw new Error(`Chrome extension bridge daemon did not start on port ${port}`);
 }
 
 async function waitForProfiles(port: number, timeoutMs: number): Promise<boolean> {
+  const expectedExtensionId = readBridgeConfig().extensionId;
   return await waitUntil(async () => {
     const health = await fetchJson(`http://127.0.0.1:${port}/health`).catch(() => null);
+    if (health?.daemon === "ok") assertCompatibleDaemon(health, expectedExtensionId);
     return Array.isArray(health?.profiles) && health.profiles.length > 0;
   }, timeoutMs);
 }
@@ -170,9 +185,24 @@ async function createSession(
   })) as BridgeSession;
 }
 
-async function isHealthy(port: number): Promise<boolean> {
-  const health = await fetchJson(`http://127.0.0.1:${port}/health`).catch(() => null);
-  return health?.daemon === "ok";
+async function readHealth(port: number): Promise<Record<string, unknown> | null> {
+  return await fetchJson(`http://127.0.0.1:${port}/health`).catch(() => null);
+}
+
+function assertCompatibleDaemon(
+  health: Record<string, unknown>,
+  expectedExtensionId: string | undefined,
+): void {
+  if (health.bridgeProtocolVersion !== BRIDGE_PROTOCOL_VERSION) {
+    throw new Error(
+      `Chrome extension bridge protocol mismatch: expected ${BRIDGE_PROTOCOL_VERSION}, got ${String(health.bridgeProtocolVersion ?? "unknown")}`,
+    );
+  }
+  if (expectedExtensionId && health.allowedExtensionId !== expectedExtensionId) {
+    throw new Error(
+      `Chrome extension bridge daemon is not pinned to extension ${expectedExtensionId}`,
+    );
+  }
 }
 
 async function waitUntil(check: () => Promise<boolean>, timeoutMs: number): Promise<boolean> {

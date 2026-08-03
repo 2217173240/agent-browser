@@ -874,7 +874,7 @@ The optional `@agent-browser/chrome-extension-provider` package adds a `chrome-e
 | `AGENT_BROWSER_CHROME_BRIDGE_PORT` | Local daemon port for the Chrome extension bridge, default `19826` |
 | `AGENT_BROWSER_CHROME_BRIDGE_PROFILE` | Profile id to use when multiple extension profiles are connected |
 | `AGENT_BROWSER_CHROME_BRIDGE_DAEMON` | Override daemon executable path |
-| `AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID` | Allow only one extension id to connect |
+| `AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID` | Override the bundled extension id allowed to connect |
 | `AGENT_BROWSER_CHROME_BRIDGE_LOG` | Optional daemon log file |
 
 ## Snapshot Options
@@ -1879,7 +1879,7 @@ Optional configuration via environment variables:
 | `AGENT_BROWSER_CHROME_BRIDGE_PORT` | Local daemon port | `19826` |
 | `AGENT_BROWSER_CHROME_BRIDGE_PROFILE` | Profile id to use when multiple extension profiles are connected | Auto-selects when only one profile is connected |
 | `AGENT_BROWSER_CHROME_BRIDGE_DAEMON` | Override daemon executable path | Bundled daemon |
-| `AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID` | Allow only one extension id to connect | Any local bridge extension |
+| `AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID` | Override the bundled extension id allowed to connect | `pimcamjccpkgapdpecfiadkemnggggbj` |
 | `AGENT_BROWSER_CHROME_BRIDGE_LOG` | Optional daemon log file | No file logging |
 
 The MVP targets ordinary web pages in desktop Chrome 120 or newer. It does not support `chrome://` pages, browser UI pages, automation of other extension pages, Chrome Web Store distribution, Native Messaging bootstrap, or external CDP features that are not already stable in agent-browser.

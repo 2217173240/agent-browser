@@ -6,13 +6,15 @@ import {
   type BridgeTab,
 } from "../src/protocol";
 
+declare const __AGENT_BROWSER_BRIDGE_DEFAULT_PORT__: number;
+
 type StoredConfig = {
   bridgeProfileId?: string;
   bridgePort?: number;
   bridgePorts?: number[];
 };
 
-const DEFAULT_PORT = 19826;
+const DEFAULT_PORT = __AGENT_BROWSER_BRIDGE_DEFAULT_PORT__;
 const CONTROL_BINDING = "__agentBrowserControl";
 const attachedTabs = new Set<number>();
 const controlOverlays = new Map<
@@ -264,14 +266,7 @@ async function executeCommand(command: BridgeCommand): Promise<unknown> {
   }
   if (command.method === "Bridge.activateTab") {
     const tabId = numberParam(command, "tabId");
-    const tab = await tabsUpdate(tabId, { active: true });
-    if (tab.windowId === undefined) throw new Error(`Chrome task window is unavailable: ${tabId}`);
-    await windowsUpdate(tab.windowId, { focused: true });
-    const [activeTab] = await tabsQuery({ active: true, windowId: tab.windowId });
-    const focusedWindow = await windowsGet(tab.windowId);
-    if (activeTab?.id !== tabId || focusedWindow.focused !== true) {
-      throw new Error("Chrome did not focus the exact controlled task tab");
-    }
+    await activateTabAndWindow(tabId);
     return {};
   }
   if (command.method === "Bridge.closeTab") {
@@ -339,9 +334,42 @@ async function executeCommand(command: BridgeCommand): Promise<unknown> {
     throw new Error(`CDP command ${command.method} is missing tabId`);
   }
   await ensureDebuggerAttached(tabId);
+  if (shouldFocusForInput(command)) {
+    await activateTabAndWindow(tabId);
+  }
   const overlay = controlOverlays.get(tabId);
   if (overlay) await injectControlOverlay(tabId, overlay);
   return await debuggerSendCommand({ tabId }, command.method, command.params ?? {});
+}
+
+function shouldFocusForInput(command: BridgeCommand): boolean {
+  if (command.method === "Input.insertText") return true;
+  const eventType = command.params?.type;
+  if (typeof eventType !== "string") return false;
+  if (command.method === "Input.dispatchMouseEvent") {
+    return eventType === "mouseMoved" || eventType === "mousePressed" || eventType === "mouseWheel";
+  }
+  if (command.method === "Input.dispatchKeyEvent") {
+    return eventType === "keyDown" || eventType === "rawKeyDown" || eventType === "char";
+  }
+  if (command.method === "Input.dispatchTouchEvent") return eventType === "touchStart";
+  return false;
+}
+
+async function activateTabAndWindow(
+  tabId: number,
+  knownWindowId?: number,
+): Promise<chrome.tabs.Tab> {
+  const tab = await tabsUpdate(tabId, { active: true });
+  const windowId = tab.windowId ?? knownWindowId;
+  if (windowId === undefined) throw new Error(`Chrome task window is unavailable: ${tabId}`);
+  await windowsUpdate(windowId, { focused: true });
+  const [activeTab] = await tabsQuery({ active: true, windowId });
+  const focusedWindow = await windowsGet(windowId);
+  if (activeTab?.id !== tabId || focusedWindow.focused !== true) {
+    throw new Error("Chrome did not focus the exact controlled task tab");
+  }
+  return tab;
 }
 
 async function ensureDebuggerAttached(tabId: number) {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:net";
 import { test } from "node:test";
 import WebSocket from "ws";
+import { PINNED_CHROME_EXTENSION_ID } from "../dist/config.js";
 import { BridgeDaemon } from "../dist/daemon/server.js";
 import { handlePluginRequest } from "../dist/plugin.js";
 
@@ -48,16 +49,22 @@ test("plugin launch returns a CDP URL after an extension profile connects", asyn
   process.env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT =
     "/session/674fb240-55e4-427e-a544-60c5b22226f0";
   process.env.NEXOLYRA_AGENT_BROWSER_SESSION_ID = "nex-aaaaaaaaaaaaaaaa";
-  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  const daemon = new BridgeDaemon({
+    port,
+    commandTimeoutMs: 5000,
+    allowedExtensionId: PINNED_CHROME_EXTENSION_ID,
+  });
   await daemon.start();
-  const extension = new WebSocket(`ws://127.0.0.1:${port}/bridge`);
+  const extension = new WebSocket(`ws://127.0.0.1:${port}/bridge`, {
+    headers: { Origin: `chrome-extension://${PINNED_CHROME_EXTENSION_ID}` },
+  });
   await onceOpen(extension);
   extension.send(
     JSON.stringify({
       v: 1,
       kind: "hello",
       profileId: "profile-a",
-      extensionId: "extension-id",
+      extensionId: PINNED_CHROME_EXTENSION_ID,
       tabs: [{ tabId: 1, url: "https://example.com", title: "Example", active: true }],
     }),
   );
@@ -93,6 +100,30 @@ test("plugin launch returns a CDP URL after an extension profile connects", asyn
     restoreEnv("AGENT_BROWSER_CHROME_BRIDGE_PORT", oldPort);
     restoreEnv("AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT", oldProfileUrlHint);
     restoreEnv("NEXOLYRA_AGENT_BROWSER_SESSION_ID", oldOwnerSessionId);
+  }
+});
+
+test("plugin refuses to reuse a daemon without the pinned extension boundary", async () => {
+  const port = await freePort();
+  const oldPort = process.env.AGENT_BROWSER_CHROME_BRIDGE_PORT;
+  process.env.AGENT_BROWSER_CHROME_BRIDGE_PORT = String(port);
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+
+  try {
+    await assert.rejects(
+      handlePluginRequest({
+        protocol: "agent-browser.plugin.v1",
+        type: "browser.launch",
+        capability: "browser.provider",
+        request: {},
+      }),
+      /not pinned to extension/,
+    );
+    assert.equal((await (await fetch(`http://127.0.0.1:${port}/health`)).json()).daemon, "ok");
+  } finally {
+    await daemon.stop();
+    restoreEnv("AGENT_BROWSER_CHROME_BRIDGE_PORT", oldPort);
   }
 });
 

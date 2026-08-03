@@ -191,6 +191,54 @@ test("daemon accepts only the pinned Chrome extension origin and identity", asyn
   }
 });
 
+test("malformed HTTP route encoding cannot terminate the bridge daemon", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+
+  try {
+    for (const path of [
+      "/control/sessions/%E0%A4%A",
+      "/control/sessions/%E0%A4%A/reconnect",
+      "/control/sessions/%E0%A4%A/targets",
+      "/sessions/%E0%A4%A/detach",
+    ]) {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+        method: path.endsWith("/targets") ? "GET" : "POST",
+        headers: { "content-type": "application/json" },
+        body: path.endsWith("/targets") ? undefined : "{}",
+      });
+      assert.equal(response.status, 400);
+    }
+
+    const health = await fetchJson(port, "/health");
+    assert.equal(health.daemon, "ok");
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("daemon rejects browser-origin control requests before they can mutate sessions", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/sessions`, {
+      method: "POST",
+      headers: {
+        "content-type": "text/plain",
+        Origin: "https://hostile.example",
+      },
+      body: "{}",
+    });
+    assert.equal(response.status, 403);
+    assert.equal((await fetchJson(port, "/health")).sessions.length, 0);
+  } finally {
+    await daemon.stop();
+  }
+});
+
 test("daemon requires an explicit profile when multiple extension profiles are connected", async () => {
   const port = await freePort();
   const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
@@ -643,6 +691,65 @@ test("reconnect selects the Nex session tab and preserves the CDP attachment id"
       targets.result.targetInfos.map((target) => target.targetId),
       ["tab:profile-a:202"],
     );
+    cdp.close();
+  } finally {
+    extension.close();
+    await daemon.stop();
+  }
+});
+
+test("failed reconnect restores the detached control fence", async () => {
+  const port = await freePort();
+  const daemon = new BridgeDaemon({ port, commandTimeoutMs: 5000 });
+  await daemon.start();
+  const extension = await connectExtension(port, "profile-a", [
+    { tabId: 101, windowId: 1, url: "https://example.com", title: "Example", active: true },
+  ]);
+
+  try {
+    const session = await postJson(port, "/sessions", {
+      ownerSessionId: "nex-aaaaaaaaaaaaaaaa",
+    });
+    const cdp = await connectCdp(port, session.sessionId, session.token);
+    const attached = await cdpCommand(cdp, {
+      id: 1,
+      method: "Target.attachToTarget",
+      params: { targetId: "tab:profile-a:101", flatten: true },
+    });
+    extension.send(
+      JSON.stringify({
+        v: 1,
+        kind: "detach",
+        profileId: "profile-a",
+        tabId: 101,
+        sessionId: attached.result.sessionId,
+        reason: "debugger_detached",
+      }),
+    );
+    await waitFor(
+      async () => (await fetchJson(port, "/health")).sessions[0].control.phase === "detached",
+    );
+
+    extension.failMethods.add("Bridge.setControlOverlay");
+    const failed = await fetch(
+      `http://127.0.0.1:${port}/control/sessions/nex-aaaaaaaaaaaaaaaa/reconnect`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ targetId: "tab:profile-a:101" }),
+      },
+    );
+    assert.equal(failed.status, 409);
+    assert.equal((await fetchJson(port, "/health")).sessions[0].control.phase, "detached");
+
+    extension.failMethods.delete("Bridge.setControlOverlay");
+    const recovered = await postJson(
+      port,
+      "/control/sessions/nex-aaaaaaaaaaaaaaaa/reconnect",
+      { targetId: "tab:profile-a:101" },
+    );
+    assert.equal(recovered.attached, true);
+    assert.equal(recovered.sessionId, attached.result.sessionId);
     cdp.close();
   } finally {
     extension.close();

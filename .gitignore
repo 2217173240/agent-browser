@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 .output/
+.wxt/
 
 # Native binaries (keep the launcher scripts)
 bin/agent-browser-*

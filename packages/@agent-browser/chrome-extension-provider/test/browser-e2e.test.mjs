@@ -14,6 +14,7 @@ const rootDir = resolve(packageDir, "../../..");
 const extensionDir = join(packageDir, ".output", "chrome-mv3");
 const daemonScript = join(packageDir, "dist", "daemon", "cli.js");
 const agentBrowserCli = join(rootDir, "bin", "agent-browser.js");
+const pinnedExtensionId = "pimcamjccpkgapdpecfiadkemnggggbj";
 
 test("Chrome extension bridge drives a real Chrome for Testing profile", async (t) => {
   const chromePath = findChromeForTesting();
@@ -30,13 +31,15 @@ test("Chrome extension bridge drives a real Chrome for Testing profile", async (
   mkdirSync(profileDir);
   mkdirSync(socketDir);
 
-  const pageUrls = fixtureUrls();
   const bridgePort = Number(process.env.AGENT_BROWSER_E2E_BRIDGE_PORT ?? 19826);
   assert.equal(await isPortOpen(bridgePort), false, `bridge e2e port ${bridgePort} is already in use`);
+  const fixture = await startFixtureServer();
+  const pageUrls = fixture.urls;
   const session = "ce";
   const commonEnv = {
     ...process.env,
     AGENT_BROWSER_CHROME_BRIDGE_PORT: String(bridgePort),
+    AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID: pinnedExtensionId,
     AGENT_BROWSER_PLUGINS: JSON.stringify([
       {
         name: "chrome-extension",
@@ -46,7 +49,11 @@ test("Chrome extension bridge drives a real Chrome for Testing profile", async (
       },
     ]),
     AGENT_BROWSER_SOCKET_DIR: socketDir,
-    AGENT_BROWSER_IDLE_TIMEOUT_MS: "1000",
+    // Real extension round-trips can cross the native daemon's one-second
+    // idle boundary between independent CLI invocations. Keep the session
+    // alive for the full scenario; the explicit close/finally block owns
+    // deterministic cleanup.
+    AGENT_BROWSER_IDLE_TIMEOUT_MS: "30000",
   };
 
   const daemon = spawn(process.execPath, [daemonScript], {
@@ -76,15 +83,27 @@ test("Chrome extension bridge drives a real Chrome for Testing profile", async (
       return health?.daemon === "ok";
     }, "bridge daemon to start");
 
+    const requireRealExtension = process.env.AGENT_BROWSER_E2E_REQUIRE_REAL_EXTENSION === "1";
+    const extensionWaitMs = Number(
+      process.env.AGENT_BROWSER_E2E_EXTENSION_WAIT_MS ?? (requireRealExtension ? 60_000 : 5_000),
+    );
     const realExtensionConnected = await waitForMaybe(async () => {
       const health = await fetchJson(`http://127.0.0.1:${bridgePort}/health`).catch(() => null);
       return Array.isArray(health?.profiles) && health.profiles.length === 1;
-    }, 5_000);
+    }, extensionWaitMs);
 
     if (!realExtensionConnected) {
+      if (requireRealExtension) {
+        throw new Error(
+          "The built Chrome extension did not connect; refusing the mock fallback because AGENT_BROWSER_E2E_REQUIRE_REAL_EXTENSION=1",
+        );
+      }
       const devtoolsPort = await waitForDevToolsPort(profileDir);
       mockBridge = await MockExtensionBridge.connect({ bridgePort, devtoolsPort });
       commonEnv.AGENT_BROWSER_CHROME_BRIDGE_PROFILE = mockBridge.profileId;
+      t.diagnostic("built extension unavailable; exercising the bridge against real Chrome through the explicit mock fallback");
+    } else {
+      t.diagnostic("built extension connected to the bridge daemon");
     }
 
     await waitFor(
@@ -121,8 +140,56 @@ ${mockBridge?.commandLog.join("\n") ?? "(real extension)"}`);
     const fill = await runAgentBrowser(["--json", "--session", session, "--provider", "chrome-extension", "fill", "#name", "Ada"], commonEnv);
     assert.equal(fill.success, true);
 
+    const filledValue = await runAgentBrowser([
+      "--json",
+      "--session",
+      session,
+      "--provider",
+      "chrome-extension",
+      "eval",
+      "document.getElementById('name').value",
+    ], commonEnv);
+    assert.equal(filledValue.success, true);
+    assert.match(JSON.stringify(filledValue.data), /Ada/);
+
+    const hitTest = await runAgentBrowser([
+      "--json",
+      "--session",
+      session,
+      "--provider",
+      "chrome-extension",
+      "eval",
+      "(() => { const e = document.getElementById('save'); const r = e.getBoundingClientRect(); return { rect: { x: r.x, y: r.y, width: r.width, height: r.height }, hitId: document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)?.id }; })()",
+    ], commonEnv);
+    assert.equal(hitTest.success, true);
+    assert.match(JSON.stringify(hitTest.data), /save/);
+
     const click = await runAgentBrowser(["--json", "--session", session, "--provider", "chrome-extension", "click", "#save"], commonEnv);
     assert.equal(click.success, true);
+
+    const clickEvents = await runAgentBrowser([
+      "--json",
+      "--session",
+      session,
+      "--provider",
+      "chrome-extension",
+      "eval",
+      "window.__bridgeE2eMouseEvents",
+    ], commonEnv);
+    assert.equal(clickEvents.success, true);
+    assert.match(JSON.stringify(clickEvents.data), /click/);
+
+    const settled = await runAgentBrowser([
+      "--json",
+      "--session",
+      session,
+      "--provider",
+      "chrome-extension",
+      "wait",
+      "--text",
+      "saved Ada",
+    ], commonEnv);
+    assert.equal(settled.success, true);
 
     const result = await runAgentBrowser([
       "--json",
@@ -153,6 +220,7 @@ ${mockBridge?.commandLog.join("\n") ?? "(real extension)"}`);
     await mockBridge?.close();
     await terminateChild(chrome);
     await terminateChild(daemon);
+    await fixture.close();
     rmSync(tmp, { force: true, recursive: true });
   }
 });
@@ -193,7 +261,9 @@ class MockExtensionBridge {
   }
 
   static async connect({ bridgePort, devtoolsPort }) {
-    const bridge = new WebSocket(`ws://127.0.0.1:${bridgePort}/bridge`);
+    const bridge = new WebSocket(`ws://127.0.0.1:${bridgePort}/bridge`, {
+      headers: { Origin: `chrome-extension://${pinnedExtensionId}` },
+    });
     await waitForWebSocketOpen(bridge);
     const instance = new MockExtensionBridge({
       bridgePort,
@@ -210,7 +280,7 @@ class MockExtensionBridge {
       v: 1,
       kind: "hello",
       profileId: instance.profileId,
-      extensionId: "browser-e2e-mock-extension",
+      extensionId: pinnedExtensionId,
       chromeVersion: version,
       tabs: await instance.tabs(),
     }));
@@ -551,22 +621,56 @@ ${error.message}`));
   });
 }
 
-function fixtureUrls() {
-  return {
-    main: htmlDataUrl(`<!doctype html>
+async function startFixtureServer() {
+  const pages = new Map([
+    ["/", `<!doctype html>
       <title>Bridge E2E</title>
+      <script>
+        window.__bridgeE2eMouseEvents = [];
+        for (const type of ["mousemove", "mousedown", "mouseup", "click"]) {
+          document.addEventListener(type, (event) => {
+            window.__bridgeE2eMouseEvents.push({ type, target: event.target.id, x: event.clientX, y: event.clientY });
+          }, true);
+        }
+      </script>
       <main>
         <h1>Bridge E2E</h1>
         <label>Name <input id="name" /></label>
         <button id="save" onclick="document.getElementById('result').textContent = 'saved ' + document.getElementById('name').value">Save</button>
         <p id="result" aria-live="polite">pending</p>
-      </main>`),
-    second: htmlDataUrl("<!doctype html><title>Second Page</title><h1>Second Page</h1>"),
+      </main>`],
+    ["/second", "<!doctype html><title>Second Page</title><h1>Second Page</h1>"],
+  ]);
+  const server = createServer((request, response) => {
+    const path = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+    const page = pages.get(path);
+    if (!page) {
+      response.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+      response.end("not found");
+      return;
+    }
+    response.writeHead(200, {
+      "cache-control": "no-store",
+      "content-type": "text/html; charset=utf-8",
+    });
+    response.end(page);
+  });
+  await new Promise((resolve, reject) => {
+    const onError = (error) => reject(error);
+    server.once("error", onError);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", onError);
+      resolve();
+    });
+  });
+  const address = server.address();
+  assert.equal(typeof address, "object");
+  assert.notEqual(address, null);
+  const origin = `http://127.0.0.1:${address.port}`;
+  return {
+    urls: { main: `${origin}/`, second: `${origin}/second` },
+    close: () => new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
   };
-}
-
-function htmlDataUrl(html) {
-  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
 }
 
 async function isPortOpen(port) {

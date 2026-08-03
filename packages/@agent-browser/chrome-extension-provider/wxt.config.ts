@@ -1,6 +1,17 @@
 import { defineConfig } from "wxt";
 
+const configuredBridgePort = Number(process.env.AGENT_BROWSER_E2E_BRIDGE_PORT ?? 19826);
+const defaultBridgePort =
+  Number.isInteger(configuredBridgePort) && configuredBridgePort > 0 && configuredBridgePort <= 65535
+    ? configuredBridgePort
+    : 19826;
+
 export default defineConfig({
+  vite: () => ({
+    define: {
+      __AGENT_BROWSER_BRIDGE_DEFAULT_PORT__: JSON.stringify(defaultBridgePort),
+    },
+  }),
   manifest: {
     name: "Agent Browser Bridge",
     version: "0.33.2",

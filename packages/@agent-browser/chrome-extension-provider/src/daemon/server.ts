@@ -144,6 +144,7 @@ const LIVE_SCREENCAST_PARAMS = {
 } as const;
 
 const DEFAULT_SESSION_RETENTION_MS = 30 * 60 * 1_000;
+const OWNER_SESSION_ID_PATTERN = /^nex-[a-f0-9]{16}$/;
 
 /** Local CDP shim that keeps browser automation in agent-browser core and forwards page commands to the extension. */
 export class BridgeDaemon {
@@ -174,13 +175,32 @@ export class BridgeDaemon {
       sessionRetentionMs: DEFAULT_SESSION_RETENTION_MS,
       ...options,
     };
-    this.loadPersistedSessions();
     this.logger = createLogger(options.logPath);
+    this.loadPersistedSessions();
     this.server = createServer((req, res) => {
-      void this.handleHttp(req, res);
+      void this.handleHttp(req, res).catch((error) => {
+        this.logger.error("bridge HTTP request failed", {
+          method: req.method ?? null,
+          path: req.url ?? null,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        if (res.headersSent) {
+          res.destroy();
+          return;
+        }
+        this.writeJson(res, 500, { error: "internal bridge error" });
+      });
     });
     this.server.on("upgrade", (req, socket, head) => {
-      this.handleUpgrade(req, socket, head);
+      try {
+        this.handleUpgrade(req, socket, head);
+      } catch (error) {
+        this.logger.error("bridge WebSocket upgrade failed", {
+          path: req.url ?? null,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        socket.destroy();
+      }
     });
     this.extensionWss.on("connection", (ws) => this.handleExtensionConnection(ws));
     this.cdpWss.on("connection", (ws, req) => this.handleCdpConnection(ws, req));
@@ -375,7 +395,7 @@ export class BridgeDaemon {
         typeof session.token !== "string" ||
         !session.token ||
         typeof session.ownerSessionId !== "string" ||
-        !/^nex-[a-f0-9]{16}$/.test(session.ownerSessionId) ||
+        !OWNER_SESSION_ID_PATTERN.test(session.ownerSessionId) ||
         !control ||
         control.phase === "stopped" ||
         typeof control.epoch !== "number" ||
@@ -439,7 +459,8 @@ export class BridgeDaemon {
     if (!statePath) return;
     const sessions: PersistedBridgeSession[] = [];
     for (const session of this.bridgeSessions.values()) {
-      if (!session.ownerSessionId || !/^nex-[a-f0-9]{16}$/.test(session.ownerSessionId)) continue;
+      if (!session.ownerSessionId || !OWNER_SESSION_ID_PATTERN.test(session.ownerSessionId))
+        continue;
       const control = this.controlStates.get(session.sessionId);
       if (!control || control.phase === "stopped") continue;
       sessions.push({
@@ -472,6 +493,15 @@ export class BridgeDaemon {
 
   private async handleHttp(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
+    // Host control requests come from the local Node runtime and therefore do
+    // not carry a browser Origin. Reject browser-initiated requests before
+    // dispatch so a hostile page cannot create sessions or mutate ownership
+    // through a blind loopback CSRF. The extension's onboarding page only
+    // needs the separately allowlisted, read-only health route below.
+    if (url.pathname !== "/health" && req.headers.origin) {
+      this.writeJson(res, 403, { error: "browser-origin requests are not allowed" });
+      return;
+    }
     if (req.method === "OPTIONS" && url.pathname === "/health") {
       const corsHeaders = this.healthCorsHeaders(req);
       if (!corsHeaders) {
@@ -513,7 +543,8 @@ export class BridgeDaemon {
         return;
       }
       const ownerSessionId =
-        typeof body.ownerSessionId === "string" && /^nex-[a-f0-9]{16}$/.test(body.ownerSessionId)
+        typeof body.ownerSessionId === "string" &&
+        OWNER_SESSION_ID_PATTERN.test(body.ownerSessionId)
           ? body.ownerSessionId
           : undefined;
       const session = this.createBridgeSession(
@@ -536,7 +567,11 @@ export class BridgeDaemon {
     }
     const controlMatch = /^\/control\/sessions\/([^/]+)$/.exec(url.pathname);
     if (req.method === "POST" && controlMatch) {
-      const ownerSessionId = decodeURIComponent(controlMatch[1]);
+      const ownerSessionId = validOwnerSessionId(controlMatch[1]);
+      if (!ownerSessionId) {
+        this.writeJson(res, 400, { error: "owner session id is invalid" });
+        return;
+      }
       const body = await readJsonBody(req);
       const phase = body.phase;
       if (phase !== "agent" && phase !== "human" && phase !== "stopped") {
@@ -560,7 +595,11 @@ export class BridgeDaemon {
     }
     const reconnectMatch = /^\/control\/sessions\/([^/]+)\/reconnect$/.exec(url.pathname);
     if (req.method === "POST" && reconnectMatch) {
-      const ownerSessionId = decodeURIComponent(reconnectMatch[1]);
+      const ownerSessionId = validOwnerSessionId(reconnectMatch[1]);
+      if (!ownerSessionId) {
+        this.writeJson(res, 400, { error: "owner session id is invalid" });
+        return;
+      }
       const body = await readJsonBody(req);
       const targetId = typeof body.targetId === "string" ? body.targetId : undefined;
       try {
@@ -580,8 +619,8 @@ export class BridgeDaemon {
     }
     const targetsMatch = /^\/control\/sessions\/([^/]+)\/targets$/.exec(url.pathname);
     if (req.method === "GET" && targetsMatch) {
-      const ownerSessionId = decodeURIComponent(targetsMatch[1]);
-      if (!/^nex-[a-f0-9]{16}$/.test(ownerSessionId)) {
+      const ownerSessionId = validOwnerSessionId(targetsMatch[1]);
+      if (!ownerSessionId) {
         this.writeJson(res, 400, { error: "owner session id is invalid" });
         return;
       }
@@ -593,7 +632,12 @@ export class BridgeDaemon {
     }
     const detachMatch = /^\/sessions\/([^/]+)\/detach$/.exec(url.pathname);
     if (req.method === "POST" && detachMatch) {
-      this.writeJson(res, 200, { detached: await this.detachBridgeSession(detachMatch[1]) });
+      const sessionId = decodePathSegment(detachMatch[1]);
+      if (!sessionId) {
+        this.writeJson(res, 400, { error: "bridge session id is invalid" });
+        return;
+      }
+      this.writeJson(res, 200, { detached: await this.detachBridgeSession(sessionId) });
       return;
     }
     this.writeJson(res, 404, { error: "not found" });
@@ -1181,24 +1225,45 @@ export class BridgeDaemon {
     if (this.hasAttachedSession(target.peer.profileId, target.tab.tabId)) {
       throw new Error("The requested Chrome tab is already controlled by another session");
     }
-    await this.setBridgeControl(session, "agent");
+    const previousControl = control ? { ...control } : undefined;
+    const previousProfileId = session.profileId;
     const previous = this.detachedAttachments.get(session.sessionId);
     const attachedSessionId =
       previous?.sessionId ?? sessionIdFor(target.tab.tabId, this.attachSequence++);
-    this.attachedSessions.set(attachedSessionId, {
-      sessionId: attachedSessionId,
-      bridgeSessionId: session.sessionId,
-      profileId: target.peer.profileId,
-      tabId: target.tab.tabId,
-    });
-    this.sessionTargetScopes.get(session.sessionId)?.attachedTargetIds.add(target.targetId);
-    this.detachedAttachments.delete(session.sessionId);
-    session.profileId = target.peer.profileId;
-    await this.showControlOverlay(
-      session,
-      this.attachedSessions.get(attachedSessionId) as AttachedSession,
-    );
-    this.persistSessions();
+    try {
+      await this.setBridgeControl(session, "agent");
+      this.attachedSessions.set(attachedSessionId, {
+        sessionId: attachedSessionId,
+        bridgeSessionId: session.sessionId,
+        profileId: target.peer.profileId,
+        tabId: target.tab.tabId,
+      });
+      this.sessionTargetScopes.get(session.sessionId)?.attachedTargetIds.add(target.targetId);
+      await this.showControlOverlay(
+        session,
+        this.attachedSessions.get(attachedSessionId) as AttachedSession,
+      );
+      this.detachedAttachments.delete(session.sessionId);
+      session.profileId = target.peer.profileId;
+      this.persistSessions();
+    } catch (error) {
+      this.attachedSessions.delete(attachedSessionId);
+      this.sessionTargetScopes.get(session.sessionId)?.attachedTargetIds.delete(target.targetId);
+      session.profileId = previousProfileId;
+      const current = this.controlStates.get(session.sessionId);
+      this.controlStates.set(session.sessionId, {
+        phase: previousControl?.phase ?? "detached",
+        epoch: Math.max(current?.epoch ?? 0, previousControl?.epoch ?? 0) + 1,
+        updatedAt: new Date().toISOString(),
+      });
+      try {
+        this.persistSessions();
+      } catch {
+        // Preserve the reconnect error. The in-memory ownership fence is
+        // already restored and a later lifecycle write can repair the file.
+      }
+      throw error;
+    }
     return {
       matched: sessions.length,
       attached: true,
@@ -1732,6 +1797,19 @@ function validProfileUrlHint(value: unknown): string | undefined {
     return undefined;
   }
   return hint.length > 1 ? hint.replace(/\/+$/, "") : hint;
+}
+
+function decodePathSegment(value: string): string | undefined {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function validOwnerSessionId(value: string): string | undefined {
+  const decoded = decodePathSegment(value);
+  return decoded && OWNER_SESSION_ID_PATTERN.test(decoded) ? decoded : undefined;
 }
 
 function validReturnOrigin(value: unknown): string | undefined {

@@ -2,6 +2,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 export const DEFAULT_BRIDGE_PORT = 19826;
+export const PINNED_CHROME_EXTENSION_ID = "pimcamjccpkgapdpecfiadkemnggggbj";
 
 export type BridgeConfig = {
   port: number;
@@ -23,7 +24,9 @@ export function readBridgeConfig(env: NodeJS.ProcessEnv = process.env): BridgeCo
     profileUrlHint: parseProfileUrlHint(env.AGENT_BROWSER_CHROME_BRIDGE_PROFILE_URL_HINT),
     returnOrigin: parseReturnOrigin(env.AGENT_BROWSER_CHROME_BRIDGE_RETURN_ORIGIN),
     daemonCommand: nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_DAEMON),
-    extensionId: parseExtensionId(env.AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID),
+    extensionId:
+      parseExtensionId(env.AGENT_BROWSER_CHROME_BRIDGE_EXTENSION_ID) ??
+      PINNED_CHROME_EXTENSION_ID,
     logPath,
     statePath:
       nonEmpty(env.AGENT_BROWSER_CHROME_BRIDGE_STATE) ||
