@@ -9,11 +9,28 @@ use crate::native::network;
 
 use super::timestamp_ms;
 
+/// Capture time of a screencast frame, in epoch milliseconds.
+///
+/// CDP sends `Network.TimeSinceEpoch`, a float in seconds; reading it as an
+/// integer yields 0 for every frame. Milliseconds match this protocol's other
+/// timestamps.
+fn frame_timestamp_ms(meta: Option<&Value>) -> u64 {
+    meta.and_then(|m| m.get("timestamp"))
+        .and_then(|v| v.as_f64())
+        .filter(|s| *s > 0.0)
+        .map(|s| (s * 1000.0) as u64)
+        .unwrap_or(0)
+}
+
 /// Background task that subscribes to CDP events and broadcasts screencast frames in real-time.
 /// Also handles auto-start/stop of screencast based on WebSocket client count.
+/// Frames go through `frame_watch` (latest value wins) while every other
+/// message type stays on the ordered `frame_tx` broadcast channel.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn cdp_event_loop(
     frame_tx: broadcast::Sender<String>,
+    frame_watch: watch::Sender<Option<Arc<super::StreamFrame>>>,
+    screencast_config: Arc<super::ScreencastConfig>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     client_notify: Arc<tokio::sync::Notify>,
     screencasting: Arc<Mutex<bool>>,
@@ -21,7 +38,6 @@ pub(super) async fn cdp_event_loop(
     cdp_session_id: Arc<RwLock<Option<String>>>,
     viewport_width: Arc<Mutex<u32>>,
     viewport_height: Arc<Mutex<u32>>,
-    last_frame: Arc<RwLock<Option<String>>>,
     last_tabs: Arc<RwLock<Vec<Value>>>,
     last_engine: Arc<RwLock<String>>,
     recording: Arc<Mutex<bool>>,
@@ -70,9 +86,9 @@ pub(super) async fn cdp_event_loop(
                             "Page.startScreencast",
                             Some(json!({
                                 "format": "jpeg",
-                                "quality": 80,
-                                "maxWidth": vw,
-                                "maxHeight": vh,
+                                "quality": screencast_config.quality,
+                                "maxWidth": screencast_config.max_width.unwrap_or(vw),
+                                "maxHeight": screencast_config.max_height.unwrap_or(vh),
                                 "everyNthFrame": 1,
                             })),
                             session_id.as_deref(),
@@ -103,8 +119,10 @@ pub(super) async fn cdp_event_loop(
                 if supports_screencast {
                     if let Some(data) = capture_live_seed(&client_arc, session_id.as_deref()).await
                     {
+                        let seq = super::next_frame_seq();
                         let msg = json!({
                             "type": "frame",
+                            "seq": seq,
                             "data": data,
                             "metadata": {
                                 "offsetTop": 0.0,
@@ -116,9 +134,10 @@ pub(super) async fn cdp_event_loop(
                                 "timestamp": timestamp_ms(),
                             }
                         });
-                        let msg_str = msg.to_string();
-                        *last_frame.write().await = Some(msg_str.clone());
-                        let _ = frame_tx.send(msg_str);
+                        frame_watch.send_replace(Some(Arc::new(super::StreamFrame {
+                            seq: Some(seq),
+                            json: msg.to_string(),
+                        })));
                     }
                 }
 
@@ -176,8 +195,10 @@ pub(super) async fn cdp_event_loop(
 
                                         if let Some(data) = evt.params.get("data").and_then(|v| v.as_str()) {
                                             let meta = evt.params.get("metadata");
+                                            let seq = super::next_frame_seq();
                                             let msg = json!({
                                                 "type": "frame",
+                                                "seq": seq,
                                                 "data": data,
                                                 "metadata": {
                                                     "offsetTop": meta.and_then(|m| m.get("offsetTop")).and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -186,15 +207,15 @@ pub(super) async fn cdp_event_loop(
                                                     "deviceHeight": vh,
                                                     "scrollOffsetX": meta.and_then(|m| m.get("scrollOffsetX")).and_then(|v| v.as_f64()).unwrap_or(0.0),
                                                     "scrollOffsetY": meta.and_then(|m| m.get("scrollOffsetY")).and_then(|v| v.as_f64()).unwrap_or(0.0),
-                                                    "timestamp": meta.and_then(|m| m.get("timestamp")).and_then(|v| v.as_u64()).unwrap_or(0),
+                                                    "timestamp": frame_timestamp_ms(meta),
                                                 }
                                             });
-                                            let msg_str = msg.to_string();
-                                            {
-                                                let mut lf = last_frame.write().await;
-                                                *lf = Some(msg_str.clone());
-                                            }
-                                            let _ = frame_tx.send(msg_str);
+                                            frame_watch.send_replace(Some(Arc::new(
+                                                super::StreamFrame {
+                                                    seq: Some(seq),
+                                                    json: msg.to_string(),
+                                                },
+                                            )));
                                         }
                                     } else if evt.method == "Runtime.consoleAPICalled" {
                                         let level = evt.params.get("type")
@@ -379,4 +400,25 @@ pub async fn ack_screencast_frame(
         )
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reading the float as an integer stamps every frame 0, so no client can
+    /// measure frame age.
+    #[test]
+    fn test_frame_timestamp_converts_cdp_seconds_to_millis() {
+        let meta = json!({ "timestamp": 1785038682.238_f64 });
+        assert_eq!(frame_timestamp_ms(Some(&meta)), 1785038682238);
+    }
+
+    #[test]
+    fn test_frame_timestamp_absent_or_zero_stays_zero() {
+        assert_eq!(frame_timestamp_ms(None), 0);
+        assert_eq!(frame_timestamp_ms(Some(&json!({}))), 0);
+        assert_eq!(frame_timestamp_ms(Some(&json!({ "timestamp": 0 }))), 0);
+        assert_eq!(frame_timestamp_ms(Some(&json!({ "timestamp": "nope" }))), 0);
+    }
 }
