@@ -49,6 +49,42 @@ const evePkg = JSON.parse(readFileSync(join(rootDir, 'packages/@agent-browser/ev
 const eveVersion = evePkg.version;
 const eveSandboxDependency = evePkg.dependencies?.['@agent-browser/sandbox'];
 
+// Read Chrome extension provider versions
+const chromeExtensionProviderPkg = JSON.parse(
+  readFileSync(join(rootDir, 'packages/@agent-browser/chrome-extension-provider/package.json'), 'utf-8'),
+);
+const chromeExtensionProviderVersion = chromeExtensionProviderPkg.version;
+const chromeExtensionProviderVersionSource = readFileSync(
+  join(rootDir, 'packages/@agent-browser/chrome-extension-provider/src/version.ts'),
+  'utf-8',
+);
+const chromeExtensionProviderRuntimeVersionMatch = chromeExtensionProviderVersionSource.match(
+  /CHROME_EXTENSION_PROVIDER_VERSION\s*=\s*"([^"]*)"/,
+);
+const chromeExtensionProviderWxtSource = readFileSync(
+  join(rootDir, 'packages/@agent-browser/chrome-extension-provider/wxt.config.ts'),
+  'utf-8',
+);
+const chromeExtensionProviderManifestVersionMatch = chromeExtensionProviderWxtSource.match(
+  /version:\s*"([^"]*)"/,
+);
+
+if (!chromeExtensionProviderRuntimeVersionMatch) {
+  console.error(
+    'Could not find CHROME_EXTENSION_PROVIDER_VERSION in packages/@agent-browser/chrome-extension-provider/src/version.ts',
+  );
+  process.exit(1);
+}
+if (!chromeExtensionProviderManifestVersionMatch) {
+  console.error(
+    'Could not find manifest version in packages/@agent-browser/chrome-extension-provider/wxt.config.ts',
+  );
+  process.exit(1);
+}
+
+const chromeExtensionProviderRuntimeVersion = chromeExtensionProviderRuntimeVersionMatch[1];
+const chromeExtensionProviderManifestVersion = chromeExtensionProviderManifestVersionMatch[1];
+
 const mismatches = [];
 if (packageVersion !== cargoVersion) {
   mismatches.push(`  cli/Cargo.toml:              ${cargoVersion}`);
@@ -67,6 +103,21 @@ if (packageVersion !== eveVersion) {
 }
 if (eveSandboxDependency !== 'workspace:^') {
   mismatches.push(`  packages/@agent-browser/eve dependency @agent-browser/sandbox: ${eveSandboxDependency}`);
+}
+if (packageVersion !== chromeExtensionProviderVersion) {
+  mismatches.push(
+    `  packages/@agent-browser/chrome-extension-provider/package.json: ${chromeExtensionProviderVersion}`,
+  );
+}
+if (packageVersion !== chromeExtensionProviderRuntimeVersion) {
+  mismatches.push(
+    `  packages/@agent-browser/chrome-extension-provider/src/version.ts: ${chromeExtensionProviderRuntimeVersion}`,
+  );
+}
+if (packageVersion !== chromeExtensionProviderManifestVersion) {
+  mismatches.push(
+    `  packages/@agent-browser/chrome-extension-provider/wxt.config.ts: ${chromeExtensionProviderManifestVersion}`,
+  );
 }
 
 if (mismatches.length > 0) {

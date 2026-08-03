@@ -3,7 +3,7 @@ import { defineConfig } from "wxt";
 export default defineConfig({
   manifest: {
     name: "Agent Browser Bridge",
-    version: "0.31.1",
+    version: "0.33.2",
     minimum_chrome_version: "120",
     permissions: ["debugger", "tabs", "storage", "alarms"],
     // This narrow grant is only for onboarding's loopback health probe. Page

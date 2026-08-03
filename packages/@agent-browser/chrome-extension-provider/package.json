@@ -1,6 +1,6 @@
 {
   "name": "@agent-browser/chrome-extension-provider",
-  "version": "0.31.1",
+  "version": "0.33.2",
   "description": "Chrome extension bridge provider for agent-browser",
   "type": "module",
   "sideEffects": false,
